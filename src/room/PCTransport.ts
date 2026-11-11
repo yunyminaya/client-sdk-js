@@ -9,7 +9,6 @@ import { NegotiationError, UnexpectedConnectionState } from './errors';
 import type { LoggerOptions } from './types';
 import { ddExtensionURI, isSVCCodec, isSafari } from './utils';
 
-/** @internal */
 interface TrackBitrateInfo {
   cid?: string;
   transceiver?: RTCRtpTransceiver;
@@ -28,57 +27,232 @@ interface TrackBitrateInfo {
  * Why same for all codecs: Target bitrate already accounts for codec efficiency
  * (e.g., users set lower targets for VP9/AV1 knowing they're more efficient).
  * Why cap at 1 Mbps: Prevents BWE from starting too aggressively on high bitrate tracks.
+ * The cap is lowered further for connections that were slow to set up, see
+ * `computeStartBitrateCap`, or that the browser reports as slow, see
+ * `connectionEffectiveTypeStartBitrateCap`.
  */
 const startBitrateMultiplier = 0.9;
 
 /** Maximum x-google-start-bitrate in kbps. 1 Mbps prevents BWE from starting too aggressively. */
 const maxStartBitrateKbps = 1000;
 
+/**
+ * Minimum x-google-start-bitrate in kbps: libwebrtc's own default starting estimate. A target
+ * below this gets no hint, since seeding above the real capacity costs more than the ramp it
+ * saves, and a slow connection is seeded no higher than this.
+ */
+const minTargetBitrateKbps = 300;
+
+/**
+ * Connection setup times (ms) bounding the ramp in `computeStartBitrateCap`: at or below the
+ * first the hint is capped at `maxStartBitrateKbps`, at or above the second at
+ * `minTargetBitrateKbps`. Measured on shaped links (CLT-3380): healthy links set up in under
+ * 860 ms, a 1 Mbps link with 150 ms RTT took 1.1–1.7 s, a 500 kbps link ~2.3 s at the median,
+ * and a 300 kbps link never under 3 s. The first sits above the 1 Mbps link, which a lower seed
+ * only slows down, and the second above the 500 kbps link's median, so only links that cannot
+ * carry more land at the floor.
+ */
+const setupTimeForMaxStartBitrateMs = 1500;
+const setupTimeForMinStartBitrateMs = 3500;
+
+/** Cap on the start bitrate hint, in kbps, when the browser reports a `3g` connection. */
+const effectiveType3gStartBitrateKbps = 500;
+
+/**
+ * The part of the Network Information API (`navigator.connection`) read here. It is Chromium
+ * only, so TypeScript's DOM typings do not declare it.
+ */
+interface NetworkInformation {
+  readonly effectiveType?: 'slow-2g' | '2g' | '3g' | '4g';
+}
+
 const debounceInterval = 20;
 
 /**
- * Applies the configured start bitrate when this media section belongs to `cid`.
- * This SDP munging is used for a bitrate setting that cannot be applied through
- * `RTCRtpEncodingParameters`.
+ * Codec payload for `codec` in this media section, when the section carries `cid`.
  *
- * Returns `undefined` when the section does not belong to the track, `0` when
- * it does but does not offer the requested codec, and the codec payload when the
- * requested codec is present (whether the bitrate was added or already set).
+ * Returns `undefined` when the section does not belong to the track, `0` when it does but
+ * does not offer the requested codec, and the codec payload otherwise.
+ *
+ * @internal
+ */
+export function findTrackCodecPayload(
+  media: MediaDescription,
+  cid: string,
+  codec: string,
+): number | undefined {
+  if (!media.msid?.includes(cid)) {
+    return undefined;
+  }
+  return media.rtp.find((rtp) => rtp.codec.toUpperCase() === codec.toUpperCase())?.payload ?? 0;
+}
+
+/**
+ * Start bitrate hinted for a single track, or `undefined` when its target is too low to
+ * be worth seeding.
+ *
+ * 90% of the target leaves ~10% headroom for the estimator to settle. The same multiplier
+ * is used for every codec because the target already reflects the codec's efficiency.
+ * Camera is capped at 1 Mbps so the estimator does not open too aggressively on a
+ * high-bitrate track; screen share is exempt, because its content needs the bitrate
+ * immediately to stay legible.
+ *
+ * The cap is lowered for a connection that was slow to set up (`computeStartBitrateCap`), and
+ * for one the browser reports as slow (`connectionEffectiveTypeStartBitrateCap`), whichever is
+ * lower. Screen share is exempt from both, however slow the connection.
+ *
+ * @internal
+ */
+export function computeTrackStartBitrate(
+  trackbr: TrackBitrateInfo,
+  connectionSetupTimeMs?: number,
+): number | undefined {
+  if (trackbr.maxbr < minTargetBitrateKbps) {
+    return undefined;
+  }
+  const calculated = Math.min(Math.round(trackbr.maxbr * startBitrateMultiplier), trackbr.maxbr);
+  if (trackbr.isScreenShare) {
+    return calculated;
+  }
+  const cap = Math.min(
+    computeStartBitrateCap(connectionSetupTimeMs),
+    connectionEffectiveTypeStartBitrateCap(),
+  );
+  return Math.min(calculated, cap);
+}
+
+/**
+ * Cap on the start bitrate hint, in kbps, from the browser's effective connection type
+ * (`navigator.connection.effectiveType`, Chromium only): `slow-2g` and `2g` cap at
+ * `minTargetBitrateKbps`, `3g` at `effectiveType3gStartBitrateKbps`.
+ *
+ * It catches links that have low bandwidth but low latency, which set up quickly and so slip
+ * past the setup time ramp. `4g`, and browsers without the API, give no guidance and stay at the
+ * `maxStartBitrateKbps` ceiling, as `computeStartBitrateCap` does without a setup time. The
+ * connection RTT the API also reports is not used: it lags behind network changes, and the setup
+ * time already reflects latency.
+ */
+function connectionEffectiveTypeStartBitrateCap(): number {
+  // A `typeof` guard, since `globalThis` is missing from some supported browsers (Chrome < 71,
+  // Firefox < 65, Safari < 12.1) and the build does not polyfill it.
+  const connection =
+    typeof navigator !== 'undefined'
+      ? (navigator as Navigator & { connection?: NetworkInformation }).connection
+      : undefined;
+  switch (connection?.effectiveType) {
+    case 'slow-2g':
+    case '2g':
+      return minTargetBitrateKbps;
+    case '3g':
+      return effectiveType3gStartBitrateKbps;
+    default:
+      return maxStartBitrateKbps;
+  }
+}
+
+/**
+ * Cap on the start bitrate hint, in kbps, from how long the connection took to set up.
+ *
+ * Connection setup time (signaling join plus ICE/DTLS) is the network signal every platform has
+ * before the first video offer, since libwebrtc cannot probe the path until a video sender
+ * exists. It grows with round-trip time and loss, which also mark the links where a 1 Mbps
+ * seed overshoots, so the cap ramps linearly from `maxStartBitrateKbps` at
+ * `setupTimeForMaxStartBitrateMs` down to `minTargetBitrateKbps` at
+ * `setupTimeForMinStartBitrateMs`. A video offer built while the connection is still being set
+ * up (publishing during connect) passes the time elapsed so far, a lower bound on the setup time.
+ * Without any timing the cap stays at the 1 Mbps ceiling.
+ */
+function computeStartBitrateCap(connectionSetupTimeMs?: number): number {
+  if (connectionSetupTimeMs === undefined) {
+    return maxStartBitrateKbps;
+  }
+  const ramp = Math.min(
+    Math.max(
+      (connectionSetupTimeMs - setupTimeForMaxStartBitrateMs) /
+        (setupTimeForMinStartBitrateMs - setupTimeForMaxStartBitrateMs),
+      0,
+    ),
+    1,
+  );
+  return Math.round(maxStartBitrateKbps - ramp * (maxStartBitrateKbps - minTargetBitrateKbps));
+}
+
+/**
+ * The single start bitrate for this peer connection: the largest hint among the video
+ * m-sections of `media` that map to a published track.
+ *
+ * libwebrtc reads `x-google-start-bitrate` per m-section but applies it to the shared
+ * `Call` (`WebRtcVideoSendChannel::ApplyChangedParams` -> `SetSdpBitrateParameters`), where
+ * `RtpBitrateConfigurator` holds one config for the whole connection. Differing per-section
+ * values are therefore last-writer-wins, decided by m-section order, so every video section
+ * gets the same number instead.
+ *
+ * Only sections that can send local media are considered. `trackBitrates` is append-only and an
+ * unpublished section keeps its `a=msid`, so matching on msid alone would still pair a stale
+ * entry with its old section — letting an uncapped screen-share target seed a connection that
+ * now carries only a camera, or consuming the one-shot hint on a section that sends nothing.
+ *
+ * The direction is the discriminator, as an exclusion rather than a match: `recvonly` and
+ * `inactive` are the only directions that cannot carry local media, and they are exactly the
+ * two a dead section lands on — unpublish sets `inactive` (explicitly in
+ * `LocalParticipant.unpublishTrack`, and via `removeTrack`'s sendonly -> inactive transition for
+ * the simulcast senders), `removeTrack` on a `sendrecv` transceiver leaves `recvonly`, and the
+ * pre-populated placeholders are `recvonly`. Everything else sends: `sendonly` from the
+ * `addTransceiver` path, `sendrecv` from the legacy `addTrack` fallback (which reuses a
+ * transceiver rather than creating a sendonly one), and a section with no direction attribute,
+ * which SDP defaults to `sendrecv`.
+ *
+ * @internal
+ */
+export function computeConnectionStartBitrate(
+  media: MediaDescription[],
+  trackBitrates: TrackBitrateInfo[],
+  connectionSetupTimeMs?: number,
+): number | undefined {
+  let connectionStartBitrate: number | undefined;
+  for (const m of media) {
+    if (m.type !== 'video' || m.direction === 'recvonly' || m.direction === 'inactive') {
+      continue;
+    }
+    for (const trackbr of trackBitrates) {
+      if (!trackbr.cid) {
+        continue;
+      }
+      const codecPayload = findTrackCodecPayload(m, trackbr.cid, trackbr.codec);
+      if (codecPayload === undefined) {
+        continue;
+      }
+      const startBitrate =
+        codecPayload > 0 ? computeTrackStartBitrate(trackbr, connectionSetupTimeMs) : undefined;
+      if (
+        startBitrate !== undefined &&
+        (connectionStartBitrate === undefined || startBitrate > connectionStartBitrate)
+      ) {
+        connectionStartBitrate = startBitrate;
+      }
+      break;
+    }
+  }
+  return connectionStartBitrate;
+}
+
+/**
+ * Declares `x-google-start-bitrate` on `codecPayload`'s fmtp. This SDP munging is used for
+ * a bitrate setting that cannot be applied through `RTCRtpEncodingParameters`.
+ *
+ * Returns whether the section now carries the hint.
  *
  * @internal
  */
 export function applyVideoStartBitrate(
   media: MediaDescription,
-  cid: string,
-  codec: string,
-  maxbr: number,
-  isScreenShare = false,
-): number | undefined {
-  if (!media.msid?.includes(cid)) {
-    return undefined;
-  }
-
-  const codecPayload =
-    media.rtp.find((rtp) => rtp.codec.toUpperCase() === codec.toUpperCase())?.payload ?? 0;
-  if (codecPayload === 0) {
-    return 0;
-  }
-
-  // Use 90% of target bitrate, capped at 1 Mbps for camera to prevent BWE
-  // from starting too aggressively. Screen share is not capped since text/UI
-  // clarity requires high bitrate from the start.
-  // TODO: dynamically adjust start bitrate based on network conditions (e.g., previous BWE estimate)
-  const calculatedStartBitrate = Math.round(maxbr * startBitrateMultiplier);
-  const startBitrate = isScreenShare
-    ? calculatedStartBitrate
-    : Math.min(calculatedStartBitrate, maxStartBitrateKbps);
-
+  codecPayload: number,
+  startBitrate: number,
+): boolean {
   const fmtp = media.fmtp.find((entry) => entry.payload === codecPayload);
   if (fmtp) {
-    // If another track's fmtp already has a start bitrate, it cannot be
-    // overridden here because the payload type is shared across the bundle.
-    // This forces every track sharing that payload to use the initial track's
-    // start bitrate.
+    // A payload type is shared across the bundle, so a value written for one section is
+    // already the connection-level one; leave it rather than rewrite it.
     if (!fmtp.config.includes('x-google-start-bitrate')) {
       fmtp.config += `;x-google-start-bitrate=${startBitrate}`;
     }
@@ -90,7 +264,7 @@ export function applyVideoStartBitrate(
     });
   }
 
-  return codecPayload;
+  return true;
 }
 
 export const PCEvents = {
@@ -104,7 +278,6 @@ export const PCEvents = {
   RTPVideoPayloadTypes: 'rtpVideoPayloadTypes',
 } as const;
 
-/** @internal */
 export default class PCTransport extends (EventEmitter as new () => TypedEmitter<PCTransportEventCallbacks>) {
   private _pc: RTCPeerConnection | null;
 
@@ -127,6 +300,11 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
 
   latestOfferId: number = 0;
 
+  private answeredOfferId: number = 0;
+
+  /** offerId (0 if unnumbered) of the answer being applied right now */
+  private answerInFlight: number | undefined;
+
   latestAcknowledgedOfferId: number = 0;
 
   private offerLock: Mutex;
@@ -140,6 +318,29 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
   renegotiate: boolean = false;
 
   trackBitrates: TrackBitrateInfo[] = [];
+
+  /**
+   * Whether an offer carrying the connection-level `x-google-start-bitrate` has been
+   * accepted locally. The hint is written once per peer connection: libwebrtc retains
+   * `start_bitrate_bps` in `RtpBitrateConfigurator` and re-applies it on network route
+   * changes, so a later rewrite is at best a no-op and at worst restarts a converged
+   * bandwidth estimator. A new peer connection (full reconnect) seeds a new estimator.
+   */
+  private hasAppliedVideoStartBitrate = false;
+
+  /**
+   * How long this peer connection took to set up, in ms, recorded once the initial connect
+   * succeeds. Lowers the start bitrate hint for a slow connection; see `computeStartBitrateCap`.
+   */
+  private connectionSetupTimeMs?: number;
+
+  /**
+   * When the connection attempt that built this peer connection began (`performance.now()`).
+   * Until `connectionSetupTimeMs` is known, the time elapsed since then is used as a lower bound
+   * on the setup time, so a video published during connect is still seeded from it rather than
+   * waiting for the connection, which would delay the offer.
+   */
+  private connectionStartedAt?: number;
 
   remoteStereoMids: string[] = [];
 
@@ -237,19 +438,49 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
     this.pendingCandidates.push(candidate);
   }
 
+  /** Whether an answer for `offerId` answers an offer older than the latest one sent. */
+  isStaleAnswer(offerId: number): boolean {
+    return this.latestOfferId > 0 && offerId > 0 && offerId !== this.latestOfferId;
+  }
+
   async setRemoteDescription(sd: RTCSessionDescriptionInit, offerId: number): Promise<boolean> {
-    if (
-      sd.type === 'answer' &&
-      this.latestOfferId > 0 &&
-      offerId > 0 &&
-      offerId !== this.latestOfferId
-    ) {
+    if (sd.type === 'answer' && this.isStaleAnswer(offerId)) {
       this.log.warn('ignoring answer for old offer', {
         offerId,
         latestOfferId: this.latestOfferId,
       });
       return false;
     }
+    if (sd.type === 'answer') {
+      if (
+        isDuplicateAnswer(
+          offerId,
+          this.answerInFlight,
+          this.answeredOfferId,
+          this._pc?.signalingState,
+          this.pendingInitialOffer !== undefined,
+        )
+      ) {
+        // a repeat of an answer already applied or being applied (e.g.
+        // duplicated by a proxy): there is no local offer left to answer
+        this.log.warn('ignoring duplicate answer', { offerId });
+        return false;
+      }
+      // claimed before any await, so a copy arriving mid-apply is caught too;
+      // released however the apply ends, so a genuine retry is still possible
+      this.answerInFlight = offerId;
+    }
+    try {
+      return await this.applyRemoteDescription(sd, offerId);
+    } finally {
+      if (sd.type === 'answer') this.answerInFlight = undefined;
+    }
+  }
+
+  private async applyRemoteDescription(
+    sd: RTCSessionDescriptionInit,
+    offerId: number,
+  ): Promise<boolean> {
     let mungedSDP: string | undefined = undefined;
     if (sd.type === 'offer') {
       let { stereoMids, nackMids } = extractStereoAndNackAudioFromOffer(sd);
@@ -331,6 +562,8 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
       mungedSDP = write(sdpParsed);
     }
     await this.setMungedSDP(sd, mungedSDP, true);
+    // only a successfully applied answer makes later copies duplicates
+    if (sd.type === 'answer' && offerId > 0) this.answeredOfferId = offerId;
 
     if (this.pendingCandidates.length > 0) {
       this.iceLog.debug('flushing queued ICE candidates', {
@@ -453,6 +686,18 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
       this.log.debug('original offer', { sdp: offer.sdp });
 
       const sdpParsed = parse(offer.sdp ?? '');
+      // One value for every video m-section, written only on the first offer that carries
+      // local video: the hint is connection-level in libwebrtc, so differing per-section
+      // values would be last-writer-wins on m-section order. Offers before any video is
+      // published (data channel or audio only) find no target and leave the latch unset.
+      const connectionStartBitrate = this.hasAppliedVideoStartBitrate
+        ? undefined
+        : computeConnectionStartBitrate(
+            sdpParsed.media,
+            this.trackBitrates,
+            this.connectionSetupTimeEstimateMs(),
+          );
+      let appliedVideoStartBitrate = false;
       sdpParsed.media.forEach((media) => {
         ensureIPAddrMatchVersion(media);
         if (media.type === 'audio') {
@@ -463,19 +708,21 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
               return false;
             }
 
-            const codecPayload = applyVideoStartBitrate(
-              media,
-              trackbr.cid,
-              trackbr.codec,
-              trackbr.maxbr,
-              trackbr.isScreenShare,
-            );
+            const codecPayload = findTrackCodecPayload(media, trackbr.cid, trackbr.codec);
             if (codecPayload === undefined) {
               return false;
             }
 
-            if (codecPayload > 0 && isSVCCodec(trackbr.codec) && !isSafari()) {
-              this.ddExtID = ensureVideoDDExtension(media, sdpParsed, this.ddExtID);
+            if (codecPayload > 0) {
+              if (connectionStartBitrate !== undefined) {
+                appliedVideoStartBitrate =
+                  applyVideoStartBitrate(media, codecPayload, connectionStartBitrate) ||
+                  appliedVideoStartBitrate;
+              }
+
+              if (isSVCCodec(trackbr.codec) && !isSafari()) {
+                this.ddExtID = ensureVideoDDExtension(media, sdpParsed, this.ddExtID);
+              }
             }
 
             return true;
@@ -500,7 +747,17 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
         });
         return;
       }
-      await this.setMungedSDP(offer, write(sdpParsed));
+      const mungedSdp = write(sdpParsed);
+      await this.setMungedSDP(offer, mungedSdp);
+      // setMungedSDP falls back to the unmunged SDP on rejection. Only consume the
+      // one-shot hint once the SDP carrying it has been accepted locally.
+      if (appliedVideoStartBitrate && offer.sdp === mungedSdp) {
+        this.hasAppliedVideoStartBitrate = true;
+        this.log.info('applied x-google-start-bitrate', {
+          startBitrateKbps: connectionStartBitrate,
+          connectionSetupTimeMs: this.connectionSetupTimeEstimateMs(),
+        });
+      }
       this.onOffer(offer, this.latestOfferId);
     } finally {
       unlock();
@@ -552,6 +809,30 @@ export default class PCTransport extends (EventEmitter as new () => TypedEmitter
 
   setTrackCodecBitrate(info: TrackBitrateInfo) {
     this.trackBitrates.push(info);
+  }
+
+  /**
+   * Record how long this peer connection took to set up. Called once, when the initial connect
+   * succeeds; resumes and ICE restarts keep the estimator they have and never call this.
+   */
+  setConnectionSetupTime(ms: number) {
+    this.connectionSetupTimeMs = ms;
+  }
+
+  /** Record when the connection attempt that built this peer connection began. */
+  setConnectionStartedAt(startedAt: number) {
+    this.connectionStartedAt = startedAt;
+  }
+
+  /** The measured setup time, or while still connecting, the time elapsed so far. */
+  private connectionSetupTimeEstimateMs(): number | undefined {
+    if (this.connectionSetupTimeMs !== undefined) {
+      return this.connectionSetupTimeMs;
+    }
+    if (this.connectionStartedAt === undefined) {
+      return undefined;
+    }
+    return Math.round(performance.now() - this.connectionStartedAt);
   }
 
   setConfiguration(rtcConfig: RTCConfiguration) {
@@ -909,6 +1190,9 @@ export function placeholderMidsFromTransceivers(
  * fresh placeholders use the default — the placeholders still converge on the
  * first value seen, so two placeholders can't disagree either. Only placeholder
  * sections are ever rewritten, and it is codec-agnostic (opus, H.265, ...).
+ * A codec without an `a=fmtp` line has empty parameters. Real sections that
+ * disagree on a payload type are not reconciled: the placeholders follow the
+ * last real section, and the real sections still differ.
  * `isPlaceholder` identifies the sections to conform.
  * @internal
  */
@@ -921,37 +1205,56 @@ export function conformBundledCodecFmtp(
   // section's value always takes precedence; otherwise the first placeholder
   // value seen is used so divergent placeholders still converge.
   const canonicalByPayload = new Map<number, string>();
-  const fromRealSection = new Set<number>();
   for (const m of media) {
     const placeholder = isPlaceholder(m);
-    for (const fmtp of m.fmtp ?? []) {
-      if (!placeholder) {
-        canonicalByPayload.set(fmtp.payload, fmtp.config);
-        fromRealSection.add(fmtp.payload);
-      } else if (!canonicalByPayload.has(fmtp.payload)) {
-        canonicalByPayload.set(fmtp.payload, fmtp.config);
+    for (const { payload } of m.rtp ?? []) {
+      const config = m.fmtp?.find((fmtp) => fmtp.payload === payload)?.config ?? '';
+      if (!placeholder || !canonicalByPayload.has(payload)) {
+        canonicalByPayload.set(payload, config);
       }
     }
   }
-  if (canonicalByPayload.size === 0) {
-    return;
-  }
-
   // Conform placeholder sections to the canonical fmtp for each shared payload.
   for (const m of media) {
     if (!isPlaceholder(m)) {
       continue;
     }
-    for (const fmtp of m.fmtp ?? []) {
-      const config = canonicalByPayload.get(fmtp.payload);
-      if (config !== undefined && fmtp.config !== config) {
+    for (const { payload } of m.rtp ?? []) {
+      // The first loop added every payload type a placeholder lists.
+      const config = canonicalByPayload.get(payload)!;
+      const fmtp = m.fmtp?.find((entry) => entry.payload === payload);
+      if (config === '') {
+        m.fmtp = (m.fmtp ?? []).filter((entry) => entry.payload !== payload);
+      } else if (fmtp) {
         fmtp.config = config;
+      } else {
+        m.fmtp = [...(m.fmtp ?? []), { payload, config }];
       }
     }
   }
 }
 
 /** @internal */
+/**
+ * Whether an incoming answer repeats one already applied or being applied.
+ * Any answer for the offer whose answer is in flight is a duplicate, numbered
+ * or not. With an offerId (current servers) an answer is also a duplicate if
+ * that offer's answer was already applied. Without one, fall back to the
+ * signaling state: in `stable` no local offer is pending, unless the initial
+ * offer is still deferred (it is set locally only once its answer arrives).
+ */
+export function isDuplicateAnswer(
+  offerId: number,
+  answerInFlight: number | undefined,
+  answeredOfferId: number,
+  signalingState: RTCSignalingState | undefined,
+  hasPendingInitialOffer: boolean,
+): boolean {
+  if (answerInFlight === offerId) return true;
+  if (offerId > 0) return offerId === answeredOfferId;
+  return signalingState === 'stable' && !hasPendingInitialOffer;
+}
+
 export function extractStereoAndNackAudioFromOffer(offer: RTCSessionDescriptionInit): {
   stereoMids: string[];
   nackMids: string[];

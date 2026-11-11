@@ -5,12 +5,21 @@ import { debounce } from '../debounce';
 import { DeviceUnsupportedError, TrackInvalidError } from '../errors';
 import { TrackEvent } from '../events';
 import type { LoggerOptions } from '../types';
-import { compareVersions, isMobile, sleep, unwrapConstraint } from '../utils';
+import {
+  compareVersions,
+  isAppleMobile,
+  isChromiumBased,
+  isMobile,
+  markDeviceAcquisitionFailure,
+  sleep,
+  unwrapConstraint,
+} from '../utils';
 import { Track, attachToElement, detachTrack } from './Track';
 import type { VideoCodec } from './options';
 import type { TrackProcessor } from './processor/types';
 import { LocalTrackRecorder, isRecordingSupported } from './record';
 import type { ReplaceTrackOptions } from './types';
+import { waitForFirstVideoFrame } from './utils';
 
 const DEFAULT_DIMENSIONS_TIMEOUT = 1000;
 const PRE_CONNECT_BUFFER_TIMEOUT = 10_000;
@@ -55,7 +64,7 @@ export default abstract class LocalTrack<
 
   protected processorElement?: HTMLMediaElement;
 
-  protected processor?: TrackProcessor<TrackKind, any>;
+  protected processor?: TrackProcessor<TrackKind, any> | undefined;
 
   protected audioContext?: AudioContext;
 
@@ -131,6 +140,10 @@ export default abstract class LocalTrack<
     return this.providedByUser;
   }
 
+  get isStopped() {
+    return this.manuallyStopped;
+  }
+
   get mediaStreamTrack() {
     return this.processor?.processedTrack ?? this._mediaStreamTrack;
   }
@@ -194,6 +207,9 @@ export default abstract class LocalTrack<
         track: newTrack,
         kind: this.kind,
         element: this.processorElement,
+        // audio processors need the context they were initialised with in order to rebuild
+        // their graph, omitting it here would leave them without one
+        audioContext: this.audioContext,
         localTrack: this,
       });
       processedTrack = this.processor.processedTrack;
@@ -217,6 +233,17 @@ export default abstract class LocalTrack<
         attachToElement(processedTrack ?? newTrack, el);
       });
     }
+    await this.onMediaStreamTrackChanged();
+  }
+
+  /**
+   * Hook invoked after the underlying MediaStreamTrack has been swapped and the processor has
+   * been restarted around it, so `processor.processedTrack` already holds the new track.
+   * Unlike `onSenderTrackSwapped` this also fires on the restart and unmute paths.
+   */
+  protected async onMediaStreamTrackChanged(): Promise<void> {
+    // base implementation is a no-op; LocalAudioTrack overrides this to move the krisp
+    // feature listeners onto the new processed track.
   }
 
   async waitForDimensions(timeout = DEFAULT_DIMENSIONS_TIMEOUT): Promise<Track.Dimensions> {
@@ -224,17 +251,34 @@ export default abstract class LocalTrack<
       throw new Error('cannot get dimensions for audio tracks');
     }
 
-    if (getBrowser()?.os === 'iOS') {
-      // browsers report wrong initial resolution on iOS.
-      // when slightly delaying the call to .getSettings(), the correct resolution is being reported
-      await sleep(10);
+    const started = Date.now();
+
+    if (isAppleMobile() || (isChromiumBased() && this.source === Track.Source.ScreenShare)) {
+      // In a few cases, wait for the first video frame:
+      //
+      // - iOS and iPadOS keep reporting the camera's sensor frame from getSettings() until the
+      //   camera has delivered its first picture, so a portrait capture initially reads as
+      //   landscape. Wait for that first frame instead of guessing at a delay.
+      //   https://github.com/livekit/client-sdk-js/issues/2099
+      //   https://github.com/livekit/client-sdk-js/issues/2107
+      //
+      // - Chrome reports the resolution a screen share asked for (1920x1080 for a 1536x664 tab), which
+      //   would announce simulcast layers at sizes they never have.
+      //   https://github.com/livekit/client-sdk-js/pull/2217
+      //
+      // Outside of these limited cases, getSettings() is already right and the first frame can
+      // be hundreds of milliseconds out (measured ~500ms on macOS Safari), which would be pure
+      // added publish latency.
+      await waitForFirstVideoFrame(this._mediaStreamTrack, timeout, this.attachedElements);
     }
 
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
+    while (true) {
       const dims = this.dimensions;
       if (dims) {
         return dims;
+      }
+      if (Date.now() - started >= timeout) {
+        break;
       }
       await sleep(50);
     }
@@ -244,7 +288,8 @@ export default abstract class LocalTrack<
   async setDeviceId(deviceId: ConstrainDOMString): Promise<boolean> {
     if (
       this._constraints.deviceId === deviceId &&
-      this._mediaStreamTrack.getSettings().deviceId === unwrapConstraint(deviceId)
+      this._mediaStreamTrack.getSettings().deviceId === unwrapConstraint(deviceId) &&
+      this._mediaStreamTrack.readyState === 'live'
     ) {
       return true;
     }
@@ -375,19 +420,37 @@ export default abstract class LocalTrack<
       this._mediaStreamTrack.stop();
 
       // create new track and attach
-      const mediaStream = await navigator.mediaDevices.getUserMedia(streamConstraints);
-      const newTrack = mediaStream.getTracks()[0];
-      if (this.kind === Track.Kind.Video) {
-        // we already captured the audio track with the constraints, so we only need to apply the video constraints
-        await newTrack.applyConstraints(otherConstraints);
+      let mediaStream: MediaStream;
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia(streamConstraints);
+      } catch (e) {
+        markDeviceAcquisitionFailure(e);
+        throw e;
       }
-      newTrack.addEventListener('ended', this.handleEnded);
-      this.log.debug('re-acquired MediaStreamTrack', this.logContext);
+      const newTrack = mediaStream.getTracks()[0];
+      try {
+        if (this.kind === Track.Kind.Video) {
+          // we already captured the audio track with the constraints, so we only need to apply the video constraints
+          await newTrack.applyConstraints(otherConstraints);
+        }
+        newTrack.addEventListener('ended', this.handleEnded);
+        this.log.debug('re-acquired MediaStreamTrack', this.logContext);
 
-      await this.setMediaStreamTrack(newTrack, false, isUnmuting);
+        await this.setMediaStreamTrack(newTrack, false, isUnmuting);
+      } catch (e) {
+        // setMediaStreamTrack can throw after acquisition but before it adopts the new track,
+        // which would leave the capture device live with nothing referencing it
+        if (this._mediaStreamTrack !== newTrack) {
+          newTrack.stop();
+        }
+        throw e;
+      }
       this._constraints = constraints;
       this.pendingDeviceChange = false;
       this.emit(TrackEvent.Restarted, this);
+      return this;
+    } finally {
+      // in the finally because a throw can also leave the new track adopted, and so still live
       if (this.manuallyStopped) {
         this.log.warn(
           'track was stopped during a restart, stopping restarted track',
@@ -395,8 +458,6 @@ export default abstract class LocalTrack<
         );
         this.stop();
       }
-      return this;
-    } finally {
       unlock();
     }
   }
@@ -464,7 +525,11 @@ export default abstract class LocalTrack<
     this._mediaStreamTrack.removeEventListener('ended', this.handleEnded);
     this._mediaStreamTrack.removeEventListener('mute', this.handleTrackMuteEvent);
     this._mediaStreamTrack.removeEventListener('unmute', this.handleTrackUnmuteEvent);
-    this.processor?.destroy();
+    // `stop` is synchronous, so we can't await the teardown of the processor here.
+    // make sure a failing teardown doesn't surface as an unhandled rejection.
+    this.processor?.destroy().catch((error) => {
+      this.log.error('failed to destroy processor', { ...this.logContext, error });
+    });
     this.processor = undefined;
   }
 
@@ -540,6 +605,11 @@ export default abstract class LocalTrack<
    * Sets a processor on this track.
    * See https://github.com/livekit/track-processors-js for example usage
    *
+   * The processor lives on the track, so stopping the track destroys it. Unpublishing and
+   * disconnecting both stop the track by default, which means a processor has to be set again on
+   * the track published after a reconnect. See {@link TrackProcessor} for the full lifecycle,
+   * including what `stopLocalTrackOnUnpublish: false` changes.
+   *
    * @param processor
    * @param showProcessedStreamLocally
    * @returns
@@ -606,6 +676,10 @@ export default abstract class LocalTrack<
     await this.onSenderTrackSwapped();
   }
 
+  /**
+   * Returns the processor currently set on this track, or `undefined` if there is none. A track
+   * that was stopped by an unpublish or a disconnect has none. See {@link TrackProcessor}.
+   */
   getProcessor() {
     return this.processor;
   }
@@ -614,6 +688,8 @@ export default abstract class LocalTrack<
    * Stops the track processor
    * See https://github.com/livekit/track-processors-js for example usage
    *
+   * Only needed to remove a processor from a track that stays published. Unpublishing or
+   * disconnecting already destroys it. See {@link TrackProcessor}.
    */
   async stopProcessor(keepElement = true) {
     const unlock = await this.trackChangeLock.lock();

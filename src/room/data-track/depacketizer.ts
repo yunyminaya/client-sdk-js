@@ -1,13 +1,13 @@
-import { type Throws } from '@livekit/throws-transformer/throws';
 import { LoggerNames, getLogger } from '../../logger';
 import type { NonSharedUint8Array } from '../../type-polyfills/non-shared-typed-arrays';
+import { type Throws } from '../../utils/throws';
 import { LivekitReasonedError } from '../errors';
 import { type DataTrackFrameInternal } from './frame';
 import { DataTrackPacket, FrameMarker } from './packet';
 import { DataTrackExtensions } from './packet/extensions';
 import { U16_MAX_SIZE, WrapAroundUnsignedInt } from './utils';
 
-const log = getLogger(LoggerNames.DataTracks);
+const log = /* @__PURE__ */ getLogger(LoggerNames.DataTracks);
 
 type PartialFrame = {
   /** Sequence of the start packet. */

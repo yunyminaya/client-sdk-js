@@ -56,13 +56,14 @@ import {
 } from '@livekit/protocol';
 import log, { LoggerNames, getLogger } from '../logger';
 import type { DataTrackHandle } from '../room/data-track/handle';
-import { type DataTrackSid } from '../room/data-track/types';
+import type { DataTrackSid } from '../room/data-track/types';
 import { ConnectionError, ConnectionErrorReason } from '../room/errors';
 import CriticalTimers from '../room/timers';
 import type { LoggerOptions } from '../room/types';
 import { getClientInfo, isCompressionStreamSupported, isReactNative, sleep } from '../room/utils';
 import type { NonSharedUint8Array } from '../type-polyfills/non-shared-typed-arrays';
 import { AsyncQueue } from '../utils/AsyncQueue';
+import { abortSignalTimeout } from '../utils/abort-signal-polyfill';
 import { announceMachine } from '../utils/machineInspector';
 import {
   type SignalLifecycleState,
@@ -92,6 +93,8 @@ interface ConnectOpts extends SignalOptions {
 export interface SignalOptions {
   autoSubscribe: boolean;
   adaptiveStream?: boolean;
+  disableIceLite?: boolean;
+  subscriberAllowPause?: boolean;
   clientInfoCapabilities?: ClientInfo_Capability[];
   maxRetries: number;
   e2eeEnabled: boolean;
@@ -432,15 +435,29 @@ export class SignalClient {
   ): Promise<JoinResponse | ReconnectResponse | undefined> {
     const unlock = await this.connectionLock.lock();
 
-    this.connectOptions = opts;
-    this.useV0SignalPath = useV0Path;
+    let rtcUrl: string;
+    let validateUrl: string;
+    try {
+      this.connectOptions = opts;
+      this.useV0SignalPath = useV0Path;
 
-    const clientInfo = getClientInfo(opts.clientInfoCapabilities);
-    const params = useV0Path
-      ? createConnectionParams(token, clientInfo, opts)
-      : await createJoinRequestConnectionParams(token, clientInfo, opts, publisherOffer);
-    const rtcUrl = createRtcUrl(url, params, useV0Path).toString();
-    const validateUrl = createValidateUrl(rtcUrl).toString();
+      const clientInfo = getClientInfo(opts.clientInfoCapabilities);
+      const params = useV0Path
+        ? createConnectionParams(token, clientInfo, opts)
+        : await createJoinRequestConnectionParams(token, clientInfo, opts, publisherOffer);
+      rtcUrl = createRtcUrl(url, params, useV0Path).toString();
+      validateUrl = createValidateUrl(rtcUrl).toString();
+    } catch (e) {
+      // the executor below owns the lock from here on
+      unlock();
+      throw e;
+    }
+
+    if (abortSignal?.aborted) {
+      unlock();
+      this.log.debug('signal connect abandoned before opening a transport');
+      throw ConnectionError.cancelled('Connection aborted');
+    }
 
     return new Promise<JoinResponse | ReconnectResponse | undefined>(async (resolve, reject) => {
       try {
@@ -455,13 +472,13 @@ export class SignalClient {
           // send leave if we have an active stream writer (connection is open)
           if (this.streamWriter && !this.isDisconnected) {
             this.sendLeave()
-              .then(() => this.close(reason))
+              .then(() => this.close(true, reason))
               .catch((e) => {
                 this.log.error(e);
-                this.close();
+                this.close(true, reason);
               });
           } else {
-            this.close();
+            this.close(true, reason);
           }
           cleanupAbortHandlers();
           // The caller may already have classified this failure: the connect timeout hands us a
@@ -495,6 +512,10 @@ export class SignalClient {
           const startClose = performance.now();
           await this.teardownTransport('replaced by a new connection attempt');
           this.log.debug(`closed previous ws connection in ${performance.now() - startClose}ms`);
+        }
+        if (alreadyAborted) {
+          this.log.debug('signal connect abandoned after tearing down the previous transport');
+          return;
         }
 
         // the transport created below belongs to this attempt; events arriving from it after a
@@ -560,6 +581,12 @@ export class SignalClient {
               }
             });
           const connection = await this.ws.opened.catch(async (reason: unknown) => {
+            if (alreadyAborted) {
+              // the abort handler has already rejected this attempt; don't probe the validate
+              // endpoint for a failure nobody is waiting on
+              this.log.debug('signal connect abandoned while the websocket was opening');
+              return;
+            }
             if (this.lifecycleState !== 'connected') {
               // claimed synchronously, before the await below: the socket's close event is already
               // on its way and would otherwise reject first with a less useful error
@@ -581,38 +608,68 @@ export class SignalClient {
           this.streamWriter = connection.writable.getWriter();
 
           // wsTimeout only guarded the upgrade; guard the first-message read with
-          // its own timeout so a silent server can't hang join() forever.
-          let firstMessage: ReadableStreamReadResult<string | ArrayBuffer>;
-          let firstMessageTimeout: ReturnType<typeof setTimeout> | undefined;
+          // its own deadline so a silent server can't hang join() forever.
+          // During reconnect, drop any stray messages that arrive before the
+          // ReconnectResponse so we do not declare the channel reconnected on the
+          // wrong signal.
+          let firstSignalResponse: SignalResponse;
           try {
-            firstMessage = await Promise.race([
-              signalReader.read(),
-              new Promise<never>((_, rejectRead) => {
-                firstMessageTimeout = setTimeout(() => {
-                  rejectRead(
-                    ConnectionError.timeout(
-                      'signal connection timed out while waiting for the first message',
-                    ),
-                  );
-                }, JOIN_RESPONSE_TIMEOUT);
-              }),
-            ]);
+            const deadline = Date.now() + JOIN_RESPONSE_TIMEOUT;
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+              const remaining = deadline - Date.now();
+              if (remaining <= 0) {
+                throw ConnectionError.timeout(
+                  'signal connection timed out while waiting for the first message',
+                );
+              }
+              let readTimeout: ReturnType<typeof setTimeout> | undefined;
+              const readResult = await Promise.race([
+                signalReader.read(),
+                new Promise<never>((_, rejectRead) => {
+                  readTimeout = setTimeout(() => {
+                    rejectRead(
+                      ConnectionError.timeout(
+                        'signal connection timed out while waiting for the first message',
+                      ),
+                    );
+                  }, remaining);
+                }),
+              ]);
+              clearTimeout(readTimeout);
+              if (!readResult.value) {
+                throw ConnectionError.internal('no message received as first message');
+              }
+              const parsed = parseSignalResponse(readResult.value);
+              if (
+                this.lifecycleState === 'reconnecting' &&
+                parsed.message?.case !== 'reconnect' &&
+                parsed.message?.case !== 'leave'
+              ) {
+                this.log.warn('dropping signal message while awaiting reconnect response', {
+                  messageCase: parsed.message?.case,
+                });
+                continue;
+              }
+              firstSignalResponse = parsed;
+              break;
+            }
           } catch (e) {
-            // No first message in time: release the reader and tear down the ws
+            // No usable first message in time: release the reader and tear down the ws
             // so we surface the timeout instead of leaking an open connection.
             signalReader.releaseLock();
             reject(e);
             this.close();
             return;
-          } finally {
-            clearTimeout(firstMessageTimeout);
           }
           signalReader.releaseLock();
-          if (!firstMessage.value) {
-            throw ConnectionError.internal('no message received as first message');
+          if (alreadyAborted) {
+            // The abort handler has already rejected this attempt and is closing the transport.
+            // Don't act on a join that raced it: `onJoined` would publish an abandoned session's
+            // state to the room.
+            this.log.debug('signal connect abandoned while waiting for the first message');
+            return;
           }
-
-          const firstSignalResponse = parseSignalResponse(firstMessage.value);
 
           // Validate the first message
           const validation = this.validateFirstMessage(
@@ -643,11 +700,7 @@ export class SignalClient {
             }
           }
 
-          // Handle successful connection
-          const firstMessageToProcess = validation.shouldProcessFirstMessage
-            ? firstSignalResponse
-            : undefined;
-          this.handleSignalConnected(connection, wsTimeout, attemptId, firstMessageToProcess);
+          this.handleSignalConnected(connection, wsTimeout, attemptId);
           resolve(validation.response);
         } catch (e) {
           reject(e);
@@ -660,13 +713,7 @@ export class SignalClient {
     });
   }
 
-  async startReadingLoop(
-    signalReader: ReadableStreamDefaultReader<string | ArrayBuffer>,
-    firstMessage?: SignalResponse,
-  ) {
-    if (firstMessage) {
-      this.handleSignalResponse(firstMessage);
-    }
+  async startReadingLoop(signalReader: ReadableStreamDefaultReader<string | ArrayBuffer>) {
     const attemptId = this.attemptId;
     while (true) {
       if (this.signalLatency) {
@@ -680,8 +727,9 @@ export class SignalClient {
         const resp = parseSignalResponse(value);
         this.handleSignalResponse(resp);
       } catch (e) {
-        this.log.error(`error reading from signal stream`, { error: e });
-        await this.handleOnClose('error in reading loop', attemptId);
+        // only an unexpected loss is an error: a read that fails because we closed the socket
+        // ourselves (or it was replaced) is logged at debug level by handleOnClose
+        await this.handleOnClose('error in reading loop', attemptId, undefined, e);
         break;
       }
     }
@@ -726,14 +774,15 @@ export class SignalClient {
   private async teardownTransport(reason: string) {
     try {
       this.clearPingInterval();
-      if (this.ws) {
-        this.ws.close({ closeCode: 1000, reason });
-
-        // calling `ws.close()` only starts the closing handshake (CLOSING state), prefer to wait until state is actually CLOSED
-        const closePromise = this.ws.closed;
+      const ws = this.ws;
+      if (ws) {
+        // released before closing, so a close that throws cannot leave the transport attached
         this.ws = undefined;
         this.streamWriter = undefined;
-        await Promise.race([closePromise, sleep(MAX_WS_CLOSE_TIME)]);
+        ws.close({ closeCode: 1000, reason });
+
+        // calling `ws.close()` only starts the closing handshake (CLOSING state), prefer to wait until state is actually CLOSED
+        await Promise.race([ws.closed, sleep(MAX_WS_CLOSE_TIME)]);
       }
     } catch (e) {
       this.log.debug('websocket error while closing', { error: e });
@@ -1099,7 +1148,12 @@ export class SignalClient {
    * Handles a transport we lost without asking to. The client goes to `offline` rather than
    * `closed`: whether this session gets resumed, restarted or given up on is the engine's call.
    */
-  private async handleOnClose(reason: string, attemptId: number = this.attemptId) {
+  private async handleOnClose(
+    reason: string,
+    attemptId: number = this.attemptId,
+    simulateReconnectDelay?: number,
+    readError?: unknown,
+  ) {
     const onCloseCallback = this.onClose;
     if (!this.sendLifecycleInput({ type: 'transportFailed', attemptId, reason })) {
       // a close we caused ourselves, or one from a transport that has since been replaced: logged
@@ -1109,11 +1163,19 @@ export class SignalClient {
         reason,
         attemptId,
         currentAttemptId: this.attemptId,
+        ...(readError !== undefined ? { error: readError } : {}),
       });
       return;
     }
+    if (readError !== undefined) {
+      this.log.error(`error reading from signal stream`, { error: readError });
+    }
     await this.teardownTransport(reason);
     this.log.info(`websocket connection closed: ${reason}`, { reason });
+    if (simulateReconnectDelay) {
+      this.log.info(`waiting for ${simulateReconnectDelay}ms until reconnecting signal`);
+      await sleep(simulateReconnectDelay);
+    }
     if (onCloseCallback) {
       onCloseCallback(reason);
     }
@@ -1129,6 +1191,10 @@ export class SignalClient {
    */
   private resetPingTimeout() {
     this.clearPingTimeout();
+    if (this.isDisconnected) {
+      // the read loop can still deliver messages while close() waits for the socket to close
+      return;
+    }
     if (!this.pingTimeoutDuration) {
       this.log.warn('ping timeout duration not set');
       return;
@@ -1184,7 +1250,6 @@ export class SignalClient {
     connection: WebSocketConnection,
     timeoutHandle: ReturnType<typeof setTimeout>,
     attemptId: number,
-    firstMessage?: SignalResponse,
   ) {
     clearTimeout(timeoutHandle);
     const established = this.sendLifecycleInput(
@@ -1205,7 +1270,7 @@ export class SignalClient {
     }
     this.log.info('signal connected');
     this.startPingInterval();
-    this.startReadingLoop(connection.readable.getReader(), firstMessage);
+    this.startReadingLoop(connection.readable.getReader());
   }
 
   /**
@@ -1222,7 +1287,6 @@ export class SignalClient {
     isValid: boolean;
     response?: JoinResponse | ReconnectResponse;
     error?: ConnectionError;
-    shouldProcessFirstMessage?: boolean;
   } {
     if (firstSignalResponse.message?.case === 'join') {
       return {
@@ -1231,22 +1295,12 @@ export class SignalClient {
       };
     } else if (
       this.lifecycleState === 'reconnecting' &&
-      firstSignalResponse.message?.case !== 'leave'
+      firstSignalResponse.message?.case === 'reconnect'
     ) {
-      if (firstSignalResponse.message?.case === 'reconnect') {
-        return {
-          isValid: true,
-          response: firstSignalResponse.message.value,
-        };
-      } else {
-        // in reconnecting, any message received means signal reconnected and we still need to process it
-        this.log.debug('declaring signal reconnected without reconnect response received');
-        return {
-          isValid: true,
-          response: undefined,
-          shouldProcessFirstMessage: true,
-        };
-      }
+      return {
+        isValid: true,
+        response: firstSignalResponse.message.value,
+      };
     } else if (this.isEstablishingConnection && firstSignalResponse.message?.case === 'leave') {
       return {
         isValid: false,
@@ -1283,7 +1337,7 @@ export class SignalClient {
     validateUrl: string,
   ): Promise<ConnectionError> {
     try {
-      const resp = await fetch(validateUrl);
+      const resp = await fetch(validateUrl, { signal: abortSignalTimeout(3000) });
 
       switch (resp.status) {
         case 404:
@@ -1312,11 +1366,13 @@ export class SignalClient {
         );
       }
     } catch (e) {
-      return e instanceof ConnectionError
-        ? e
-        : ConnectionError.serverUnreachable(
-            e instanceof Error ? e.message : 'server was not reachable',
-          );
+      if (e instanceof ConnectionError) {
+        return e;
+      } else {
+        return ConnectionError.serverUnreachable(
+          e instanceof Error ? e.message : 'server was not reachable',
+        );
+      }
     }
   }
 }
@@ -1394,6 +1450,14 @@ function createConnectionParams(
     params.set('adaptive_stream', '1');
   }
 
+  if (opts.disableIceLite) {
+    params.set('disable_ice_lite', '1');
+  }
+
+  if (typeof opts.subscriberAllowPause !== 'undefined') {
+    params.set('subscriber_allow_pause', opts.subscriberAllowPause ? '1' : '0');
+  }
+
   if (opts.reconnectReason) {
     params.set('reconnect_reason', opts.reconnectReason.toString());
   }
@@ -1421,6 +1485,8 @@ async function createJoinRequestConnectionParams(
     connectionSettings: new ConnectionSettings({
       autoSubscribe: !!opts.autoSubscribe,
       adaptiveStream: !!opts.adaptiveStream,
+      disableIceLite: !!opts.disableIceLite,
+      subscriberAllowPause: opts.subscriberAllowPause,
     }),
     reconnect: !!opts.reconnect,
     participantSid: opts.sid ? opts.sid : undefined,

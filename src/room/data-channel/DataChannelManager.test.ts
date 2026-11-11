@@ -1,3 +1,4 @@
+import { NegotiatedDataChannelID } from '@livekit/protocol';
 import { describe, expect, it, vi } from 'vitest';
 import type { PCTransportManager } from '../PCTransportManager';
 import { UnexpectedConnectionState } from '../errors';
@@ -17,14 +18,21 @@ class FakeDataChannel extends EventTarget {
 
   onbufferedamountlow: (() => void) | null = null;
 
+  readyState: RTCDataChannelState = 'open';
+
   send = vi.fn();
 
-  close = vi.fn();
+  close = vi.fn(() => {
+    this.readyState = 'closing';
+  });
 
   constructor(public label: string) {
     super();
   }
 }
+
+const reliableHandle = (manager: DataChannelManager) =>
+  manager.getHandle(DataChannelKind.RELIABLE) as RTCDataChannel;
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -89,22 +97,68 @@ describe('DataChannelManager', () => {
     manager.lossy.stopThresholdTuning();
   });
 
-  it('recreating channels rejects waiters parked on the replaced handles', async () => {
-    const { manager, pcManager, created } = makeManager();
+  it('recreating channels closes the replaced handles and rejects waiters parked on them', async () => {
+    const { manager, opts, pcManager, created } = makeManager();
     manager.createPublisherChannels(pcManager);
+    const firstGeneration = { ...created };
 
     // Park a reliable sender on the first-generation channel.
     created._reliable.bufferedAmount = 2 * 1024 * 1024;
-    const parked = manager.reliable.waitForHeadroomWithLock();
+    const parked = manager.reliable.waitForHeadroomWithLock(reliableHandle(manager));
     parked.catch(() => {});
     await tick();
 
-    // Safari null-id path: channels recreated without closing the old ones.
+    // Safari null-id path: channels recreated while the old ones are still open.
     manager.createPublisherChannels(pcManager);
 
     await expect(parked).rejects.toBeInstanceOf(UnexpectedConnectionState);
+    for (const dc of Object.values(firstGeneration)) {
+      expect(dc.close).toHaveBeenCalled();
+      // Unhooked before closing, so the deliberate close isn't reported as an unexpected one.
+      expect(dc.onclose).toBeNull();
+      expect(dc.onbufferedamountlow).toBeNull();
+    }
+    expect(opts.onChannelClose).not.toHaveBeenCalled();
     // The gate recovers against the fresh (empty) channel.
-    await expect(manager.reliable.waitForHeadroomWithLock()).resolves.toBeUndefined();
+    await expect(
+      manager.reliable.waitForHeadroomWithLock(reliableHandle(manager)),
+    ).resolves.toBeUndefined();
+
+    manager.lossy.stopThresholdTuning();
+  });
+
+  it('creates negotiated channels with fixed ids and can fall back to in-band ones', () => {
+    const { manager, pcManager } = makeManager();
+    const createSpy = vi.mocked(pcManager.createPublisherDataChannel);
+
+    manager.createPublisherChannels(pcManager, true);
+
+    expect(manager.publisherChannelsNegotiated).toBe(true);
+    expect(createSpy).toHaveBeenCalledWith('_reliable', {
+      ordered: true,
+      negotiated: true,
+      id: NegotiatedDataChannelID.NDCI_RELIABLE,
+    });
+    expect(createSpy).toHaveBeenCalledWith('_lossy', {
+      ordered: false,
+      maxRetransmits: 0,
+      negotiated: true,
+      id: NegotiatedDataChannelID.NDCI_LOSSY,
+    });
+    expect(createSpy).toHaveBeenCalledWith('_data_track', {
+      ordered: false,
+      maxRetransmits: 0,
+      negotiated: true,
+      id: NegotiatedDataChannelID.NDCI_DATA_TRACK,
+    });
+
+    createSpy.mockClear();
+    manager.createPublisherChannels(pcManager, false);
+
+    expect(manager.publisherChannelsNegotiated).toBe(false);
+    expect(createSpy).toHaveBeenCalledWith('_reliable', { ordered: true });
+    manager.teardown();
+    expect(manager.publisherChannelsNegotiated).toBe(false);
 
     manager.lossy.stopThresholdTuning();
   });
@@ -133,7 +187,7 @@ describe('DataChannelManager', () => {
     manager.adoptSubscriberChannel(sub as unknown as RTCDataChannel);
 
     created._reliable.bufferedAmount = 2 * 1024 * 1024;
-    const parked = manager.reliable.waitForHeadroomWithLock();
+    const parked = manager.reliable.waitForHeadroomWithLock(reliableHandle(manager));
     parked.catch(() => {});
     await tick();
 

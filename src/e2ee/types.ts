@@ -53,6 +53,8 @@ export interface EncodeMessage extends BaseMessage {
     writableStream: WritableStream;
     trackId: string;
     codec?: VideoCodec;
+    /** whether the publication of a received track is marked encrypted, unused on encode */
+    encrypted?: boolean;
     /**
      * Whether the published track advertises packet trailer features.
      * When false, the cryptor skips the per-frame trailer extraction path
@@ -89,6 +91,10 @@ export interface UpdateCodecMessage extends BaseMessage {
      */
     previousTrackId?: string;
     hasPacketTrailer: boolean;
+    /** whether the publication of a received track is marked encrypted, unused on encode */
+    encrypted?: boolean;
+    /** which cryptor the update is for, a receiver's ('decode') when omitted */
+    operation?: 'encode' | 'decode';
   };
 }
 
@@ -123,6 +129,11 @@ export interface EnableMessage extends BaseMessage {
   data: {
     participantIdentity: string;
     enabled: boolean;
+    /**
+     * Set when the app enables or disables encryption for the local participant. Only such a
+     * message changes whether local media is encrypted.
+     */
+    local?: boolean;
   };
 }
 
@@ -176,6 +187,22 @@ export interface PTMetadataFromE2EEMessage extends BaseMessage {
   data: FrameMetadataPayload;
 }
 
+export interface LogMessage extends BaseMessage {
+  kind: 'log';
+  data: {
+    level: 'trace' | 'debug' | 'info' | 'warn' | 'error';
+    msg: string;
+    context?: object;
+  };
+}
+
+export interface SetLogLevelMessage extends BaseMessage {
+  kind: 'setLogLevel';
+  data: {
+    level: LogLevel;
+  };
+}
+
 export type E2EEWorkerMessage =
   | InitMessage
   | SetKeyMessage
@@ -193,7 +220,9 @@ export type E2EEWorkerMessage =
   | DecryptDataResponseMessage
   | EncryptDataRequestMessage
   | EncryptDataResponseMessage
-  | PTMetadataFromE2EEMessage;
+  | PTMetadataFromE2EEMessage
+  | LogMessage
+  | SetLogLevelMessage;
 
 export type KeySet = { material: CryptoKey; encryptionKey: CryptoKey };
 
@@ -226,6 +255,7 @@ export type KeyInfo = {
 
 export type E2EEManagerOptions = {
   keyProvider: BaseKeyProvider;
+  /** The worker holds the encryption state of one room. Do not share it between rooms. */
   worker: Worker;
 };
 
@@ -248,6 +278,8 @@ export type ScriptTransformOptions = {
   participantIdentity: string;
   trackId: string;
   codec?: VideoCodec;
+  /** whether the publication of a received track is marked encrypted, unused on encode */
+  encrypted?: boolean;
   /**
    * Whether the published track advertises packet trailer features.
    * When false, the cryptor skips the per-frame trailer extraction path

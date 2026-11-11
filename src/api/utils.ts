@@ -44,7 +44,7 @@ export function parseSignalResponse(value: ArrayBuffer | string) {
 export function getAbortReasonAsString(
   signal: AbortSignal | Error | unknown,
   defaultMessage = 'Unknown reason',
-) {
+): string {
   // the connect timeout hands this an Error rather than a signal, and its message is the only
   // description of what went wrong — without this a timeout reports itself as a generic abort
   if (signal instanceof Error) {
@@ -62,4 +62,14 @@ export function getAbortReasonAsString(
     default:
       return 'toString' in reason ? reason.toString() : defaultMessage;
   }
+}
+
+export function getErrorDescription(error: unknown, errorCategory: string): string {
+  if (error instanceof Error) {
+    if (error.name && error.message) {
+      return `${error.name}: ${error.message}`;
+    }
+    return error.name;
+  }
+  return `Encountered unknown ${errorCategory} error: ${String(error)}`;
 }

@@ -1,6 +1,7 @@
 // TODO code inspired by https://github.com/webrtc/samples/blob/gh-pages/src/content/insertable-streams/endtoend-encryption/js/worker.js
 import { EventEmitter } from 'events';
 import type TypedEventEmitter from 'typed-emitter';
+import { getErrorDescription } from '../../api/utils';
 import {
   appendPacketTrailerToEncodedFrame,
   processPacketTrailer,
@@ -22,11 +23,27 @@ import type {
   RatchetResult,
 } from '../types';
 import { deriveKeys, isVideoFrame, needsRbspUnescaping, parseRbsp, writeRbsp } from '../utils';
+import { ErrorRateLimiter } from './ErrorRateLimiter';
 import type { ParticipantKeyHandler } from './ParticipantKeyHandler';
-import { processNALUsForEncryption } from './naluUtils';
+import {
+  normalizeAnnexBStartCodes,
+  parseH264IdrPpsId,
+  processNALUsForEncryption,
+} from './naluUtils';
 import { identifySifPayload } from './sifPayload';
 
-export const encryptionEnabledMap: Map<string, boolean> = new Map();
+/**
+ * With one bit of the PPS id encrypted, each attempt matches with probability 1/2, so 16 attempts
+ * all miss with probability 2^-16. After the last attempt the frame goes out as it is.
+ */
+const MAX_PPS_ID_ENCRYPT_ATTEMPTS = 16;
+
+let localEncryptionEnabled: boolean | undefined;
+
+/** Sets whether local media is encrypted. */
+export function setLocalEncryptionEnabled(enabled: boolean | undefined) {
+  localEncryptionEnabled = enabled;
+}
 
 export interface FrameCryptorConstructor {
   new (opts?: unknown): BaseFrameCryptor;
@@ -66,6 +83,8 @@ export class FrameCryptor extends BaseFrameCryptor {
   private participantIdentity: string | undefined;
 
   private trackId: string | undefined;
+
+  private encrypted: boolean | undefined;
 
   private keys: ParticipantKeyHandler;
 
@@ -111,18 +130,7 @@ export class FrameCryptor extends BaseFrameCryptor {
 
   private frameMetadataFrameId = 0;
 
-  /**
-   * Throttling mechanism for decryption errors to prevent memory leaks
-   */
-  private lastErrorTimestamp: Map<string, number> = new Map();
-
-  private errorCounts: Map<string, number> = new Map();
-
-  private readonly ERROR_THROTTLE_MS = 1000; // Emit error at most once per second
-
-  private readonly MAX_ERRORS_PER_MINUTE = 5; // Maximum errors to emit per minute per key
-
-  private readonly ERROR_WINDOW_MS = 60000; // 1 minute window
+  private errorLimiter = new ErrorRateLimiter();
 
   private undecryptedTrackTimeout?: ReturnType<typeof setTimeout>;
 
@@ -196,16 +204,19 @@ export class FrameCryptor extends BaseFrameCryptor {
     clearTimeout(this.undecryptedTrackTimeout);
     this.undecryptedTrackTimeout = undefined;
     this.participantIdentity = undefined;
-    this.lastErrorTimestamp = new Map();
-    this.errorCounts = new Map();
+    this.encrypted = undefined;
+    this.errorLimiter.reset();
+  }
+
+  /**
+   * Sets whether the received track is encrypted, from the track's own publication.
+   */
+  setEncrypted(encrypted: boolean | undefined) {
+    this.encrypted = encrypted;
   }
 
   isEnabled() {
-    if (this.participantIdentity) {
-      return encryptionEnabledMap.get(this.participantIdentity);
-    } else {
-      return undefined;
-    }
+    return this.participantIdentity ? this.encrypted : undefined;
   }
 
   getParticipantIdentity() {
@@ -421,64 +432,24 @@ export class FrameCryptor extends BaseFrameCryptor {
     this.sifTrailer = trailer;
   }
 
-  /**
-   * Checks if we should emit an error based on throttling rules to prevent memory leaks
-   * @param errorKey - unique key identifying the error context
-   * @returns true if the error should be emitted, false otherwise
-   */
-  private shouldEmitError(errorKey: string): boolean {
-    const now = Date.now();
-    const lastErrorTime = this.lastErrorTimestamp.get(errorKey) ?? 0;
-    const errorCount = this.errorCounts.get(errorKey) ?? 0;
-
-    // Reset count if we're in a new time window
-    if (now - lastErrorTime > this.ERROR_WINDOW_MS) {
-      this.errorCounts.set(errorKey, 0);
-      this.lastErrorTimestamp.set(errorKey, now);
-      return true;
-    }
-
-    // Check if we've exceeded the throttle time
-    if (now - lastErrorTime < this.ERROR_THROTTLE_MS) {
-      return false;
-    }
-
-    // Check if we've exceeded the max errors per window
-    if (errorCount >= this.MAX_ERRORS_PER_MINUTE) {
-      // Only log a warning once when hitting the limit
-      if (errorCount === this.MAX_ERRORS_PER_MINUTE) {
-        workerLogger.warn(`Suppressing further decryption errors for ${this.participantIdentity}`, {
-          ...this.logContext,
-          errorKey,
-        });
-        this.errorCounts.set(errorKey, errorCount + 1);
-      }
-      return false;
-    }
-
-    // Update tracking
-    this.lastErrorTimestamp.set(errorKey, now);
-    this.errorCounts.set(errorKey, errorCount + 1);
-    return true;
-  }
-
-  /**
-   * Emits a throttled error to prevent memory leaks from repeated decryption failures
-   * @param error - the CryptorError to emit
-   */
   private emitThrottledError(error: CryptorError) {
     const errorKey = `${this.participantIdentity}-${error.reason}-decrypt`;
+    const emit = this.errorLimiter.shouldEmit(errorKey, () => {
+      workerLogger.warn(`Suppressing further decryption errors for ${this.participantIdentity}`, {
+        ...this.logContext,
+        errorKey,
+      });
+    });
+    if (!emit) return;
 
-    if (this.shouldEmitError(errorKey)) {
-      const errorCount = this.errorCounts.get(errorKey) ?? 0;
-      if (errorCount > 1) {
-        workerLogger.debug(`Decryption error (${errorCount} occurrences in window)`, {
-          ...this.logContext,
-          reason: CryptorErrorReason[error.reason],
-        });
-      }
-      this.emit(CryptorEvent.Error, error);
+    const count = this.errorLimiter.countFor(errorKey);
+    if (count > 1) {
+      workerLogger.debug(`Decryption error (${count} occurrences in window)`, {
+        ...this.logContext,
+        reason: CryptorErrorReason[error.reason],
+      });
     }
+    this.emit(CryptorEvent.Error, error);
   }
 
   /**
@@ -512,7 +483,17 @@ export class FrameCryptor extends BaseFrameCryptor {
       return controller.enqueue(encodedFrame);
     }
 
-    if (!this.isEnabled()) {
+    if (localEncryptionEnabled === undefined) {
+      this.emitThrottledError(
+        new CryptorError(
+          `encryption state unknown for track ${this.trackId}, dropping frame`,
+          CryptorErrorReason.InternalError,
+          this.participantIdentity,
+        ),
+      );
+      return;
+    }
+    if (!localEncryptionEnabled) {
       this.appendFrameMetadata(encodedFrame);
       return controller.enqueue(encodedFrame);
     }
@@ -533,14 +514,23 @@ export class FrameCryptor extends BaseFrameCryptor {
     const keyIndex = this.keys.getCurrentKeyIndex();
 
     if (encryptionKey) {
-      const iv = this.makeIV(
+      let iv = this.makeIV(
         encodedFrame.getMetadata().synchronizationSource ?? -1,
         encodedFrame.timestamp,
       );
       let frameInfo = this.getUnencryptedBytes(encodedFrame);
 
       // Thіs is not encrypted and contains the VP8 payload descriptor or the Opus TOC byte.
-      const frameHeader = new Uint8Array(encodedFrame.data, 0, frameInfo.unencryptedBytes);
+      let frameHeader: NonSharedUint8Array = new Uint8Array(
+        encodedFrame.data,
+        0,
+        frameInfo.unencryptedBytes,
+      );
+      if (frameInfo.requiresNALUProcessing) {
+        // The receiver's depacketizer rebuilds NALUs with 4-byte start codes, so authenticate (and
+        // send) the header in that form or decryption fails for encoders emitting 3-byte ones.
+        frameHeader = normalizeAnnexBStartCodes(frameHeader);
+      }
 
       // Frame trailer contains the R|IV_LENGTH and key index
       const frameTrailer = new Uint8Array(2);
@@ -556,15 +546,44 @@ export class FrameCryptor extends BaseFrameCryptor {
       // payload  |IV...(length = IV_LENGTH)|R|IV_LENGTH|KID |
       // ---------+-------------------------+-+---------+----
       try {
-        const cipherText = await crypto.subtle.encrypt(
-          {
-            name: ENCRYPTION_ALGORITHM,
-            iv,
-            additionalData: new Uint8Array(encodedFrame.data, 0, frameHeader.byteLength),
-          },
-          encryptionKey,
-          new Uint8Array(encodedFrame.data, frameInfo.unencryptedBytes),
-        );
+        // Chrome reads pic_parameter_set_id from an H.264 IDR slice before the decrypt transform,
+        // and drops the keyframe if the id names an unknown PPS. Some encoders put the id past the
+        // unencrypted bytes (#2180), so encrypt again with a fresh IV until the sent bits still
+        // read as the true id. The receiver takes the IV from the trailer, so it needs no change.
+        const sliceStart = frameInfo.unencryptedBytes - 2;
+        const ppsId = frameInfo.requiresNALUProcessing
+          ? parseH264IdrPpsId(new Uint8Array(encodedFrame.data, sliceStart))
+          : null;
+        let cipherText: ArrayBuffer;
+        for (let attempt = 1; ; attempt++) {
+          cipherText = await crypto.subtle.encrypt(
+            {
+              name: ENCRYPTION_ALGORITHM,
+              iv,
+              additionalData: frameHeader,
+            },
+            encryptionKey,
+            new Uint8Array(encodedFrame.data, frameInfo.unencryptedBytes),
+          );
+
+          if (ppsId === null || attempt === MAX_PPS_ID_ENCRYPT_ATTEMPTS) {
+            break;
+          }
+          // The slice as the receiver sees it: its 2 unencrypted bytes, then the escaped
+          // ciphertext. writeRbsp works byte by byte, so escaping the first 16 bytes gives the
+          // start of the escaped frame, and a retry costs only the encryption.
+          const escapedStart = writeRbsp(new Uint8Array(cipherText, 0, 16));
+          const sentSlice = new Uint8Array(2 + escapedStart.byteLength);
+          sentSlice.set(new Uint8Array(encodedFrame.data, sliceStart, 2));
+          sentSlice.set(escapedStart, 2);
+          if (parseH264IdrPpsId(sentSlice) === ppsId) {
+            break;
+          }
+          iv = this.makeIV(
+            encodedFrame.getMetadata().synchronizationSource ?? -1,
+            encodedFrame.timestamp,
+          );
+        }
 
         let newDataWithoutHeader: NonSharedUint8Array = new Uint8Array(
           cipherText.byteLength + iv.byteLength + frameTrailer.byteLength,
@@ -587,7 +606,7 @@ export class FrameCryptor extends BaseFrameCryptor {
         return controller.enqueue(encodedFrame);
       } catch (e: any) {
         // TODO: surface this to the app.
-        workerLogger.error(e);
+        workerLogger.error(`error while encrypting`, { ...this.logContext, error: e });
       }
     } else {
       workerLogger.debug('failed to encrypt, emitting error', this.logContext);
@@ -858,7 +877,7 @@ export class FrameCryptor extends BaseFrameCryptor {
         }
       } else {
         throw new CryptorError(
-          `Decryption failed: ${error.message}`,
+          `Decryption failed: ${getErrorDescription(error, 'decryption')}`,
           CryptorErrorReason.InvalidKey,
           this.participantIdentity,
         );
@@ -956,7 +975,7 @@ export class FrameCryptor extends BaseFrameCryptor {
         };
       }
     } catch (e) {
-      this.logNALUFallbackOnce(fallbackKey, payloadType, e);
+      this.logNALUFallbackOnce(fallbackKey, frame, payloadType, detectedCodec, e);
     }
 
     // Fallback to VP8 handling
@@ -969,7 +988,9 @@ export class FrameCryptor extends BaseFrameCryptor {
    */
   private logNALUFallbackOnce(
     fallbackKey: string,
+    frame: RTCEncodedVideoFrame,
     payloadType: number | undefined,
+    detectedCodec: VideoCodec | undefined,
     error: unknown,
   ) {
     if (this.loggedNALUFallbacks.has(fallbackKey)) {
@@ -979,6 +1000,12 @@ export class FrameCryptor extends BaseFrameCryptor {
     workerLogger.warn('NALU processing failed, falling back to VP8 handling', {
       error,
       payloadType,
+      detectedCodec,
+      frameType: frame.type,
+      byteLength: frame.data.byteLength,
+      firstBytes: Array.from(new Uint8Array(frame.data, 0, Math.min(16, frame.data.byteLength)))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join(' '),
       ...this.logContext,
     });
   }

@@ -24,7 +24,7 @@ import type {
   TextStreamInfo,
 } from '../../types';
 import {
-  isCompressionStreamSupported,
+  isDeflateRawCompressionSupported,
   numberToBigInt,
   readBytesInChunks,
   readableFromBytes,
@@ -39,11 +39,10 @@ import {
   createStreamHeaderPacket,
 } from './header-utils';
 
-const textEncoder = new TextEncoder();
+const textEncoder = /* @__PURE__ */ new TextEncoder();
 
 /**
  * Manages sending custom user data via data channels.
- * @internal
  */
 export default class OutgoingDataStreamManager {
   protected engine: RTCEngine;
@@ -101,7 +100,7 @@ export default class OutgoingDataStreamManager {
 
     const compressEligible =
       compress &&
-      isCompressionStreamSupported() &&
+      isDeflateRawCompressionSupported() &&
       this.allRecipientsSupportV2(options?.destinationIdentities) &&
       this.allRecipientsSupportCompression(options?.destinationIdentities);
     let compressedStream = compressEligible
@@ -239,7 +238,7 @@ export default class OutgoingDataStreamManager {
 
     const compressEligible =
       compress &&
-      isCompressionStreamSupported() &&
+      isDeflateRawCompressionSupported() &&
       this.allRecipientsSupportV2(destinationIdentities) &&
       this.allRecipientsSupportCompression(destinationIdentities);
     let compressedStream = compressEligible
@@ -463,7 +462,7 @@ export default class OutgoingDataStreamManager {
     const destinationIdentities = options?.destinationIdentities;
     const compress =
       (options?.compress ?? true) &&
-      isCompressionStreamSupported() &&
+      isDeflateRawCompressionSupported() &&
       this.allRecipientsSupportV2(destinationIdentities) &&
       this.allRecipientsSupportCompression(destinationIdentities);
 

@@ -18,10 +18,12 @@ import type {
   ScriptTransformOptions,
 } from '../types';
 import { DataCryptor } from './DataCryptor';
-import { FrameCryptor, encryptionEnabledMap } from './FrameCryptor';
+import { ErrorRateLimiter } from './ErrorRateLimiter';
+import { FrameCryptor, setLocalEncryptionEnabled } from './FrameCryptor';
 import { ParticipantKeyHandler } from './ParticipantKeyHandler';
 
-const participantCryptors: FrameCryptor[] = [];
+// senders and receivers have separate cryptors
+const cryptorsByOperation: Record<'encode' | 'decode', FrameCryptor[]> = { encode: [], decode: [] };
 const participantKeys: Map<string, ParticipantKeyHandler> = new Map();
 let sharedKeyHandler: ParticipantKeyHandler | undefined;
 let messageQueue = new AsyncQueue();
@@ -36,7 +38,20 @@ let keyProviderOptions: KeyProviderOptions = KEY_PROVIDER_DEFAULTS;
 
 let rtpMap: Map<number, VideoCodec> = new Map();
 
+const dataDecryptErrorLimiter = new ErrorRateLimiter();
+
 workerLogger.setDefaultLevel('info');
+
+// Forward worker log calls to the main thread so they reach any
+// setLogExtension consumer installed there. The main-thread workerLogger
+// re-emits them, which invokes both the console and the extension.
+workerLogger.methodFactory = (methodName) => (msg, context) => {
+  postMessage({
+    kind: 'log',
+    data: { level: methodName, msg, context },
+  });
+};
+workerLogger.setLevel(workerLogger.getLevel());
 
 onmessage = (ev) => {
   messageQueue.run(async () => {
@@ -45,7 +60,7 @@ onmessage = (ev) => {
     switch (kind) {
       case 'init':
         workerLogger.setLevel(data.loglevel);
-        workerLogger.info('worker initialized');
+        workerLogger.info('e2ee worker initialized');
         keyProviderOptions = data.keyProviderOptions;
         useSharedKey = !!data.keyProviderOptions.sharedKey;
         // acknowledge init successful
@@ -55,8 +70,13 @@ onmessage = (ev) => {
         };
         postMessage(ackMsg);
         break;
+      case 'setLogLevel':
+        workerLogger.setLevel(data.level);
+        break;
       case 'enable':
-        setEncryptionEnabled(data.enabled, data.participantIdentity);
+        if (data.local) {
+          setLocalEncryptionEnabled(data.enabled);
+        }
         workerLogger.info(
           `updated e2ee enabled status for ${data.participantIdentity} to ${data.enabled}`,
         );
@@ -64,7 +84,8 @@ onmessage = (ev) => {
         postMessage(ev.data);
         break;
       case 'decode':
-        let cryptor = getTrackCryptor(data.participantIdentity, data.trackId);
+        let cryptor = getTrackCryptor(kind, data.participantIdentity, data.trackId);
+        cryptor.setEncrypted(data.encrypted);
         cryptor.setHasFrameMetadata(data.hasPacketTrailer);
         cryptor.setupTransform(
           kind,
@@ -75,7 +96,7 @@ onmessage = (ev) => {
         );
         break;
       case 'encode':
-        let pubCryptor = getTrackCryptor(data.participantIdentity, data.trackId);
+        let pubCryptor = getTrackCryptor(kind, data.participantIdentity, data.trackId);
         pubCryptor.setHasFrameMetadata(data.hasPacketTrailer);
         pubCryptor.setupTransform(
           kind,
@@ -96,11 +117,6 @@ onmessage = (ev) => {
           data.payload,
           getParticipantKeyHandler(data.participantIdentity),
         );
-        console.log('encrypted payload', {
-          original: data.payload,
-          encrypted: encryptedPayload,
-          iv,
-        });
         postMessage({
           kind: 'encryptDataResponse',
           data: {
@@ -125,12 +141,23 @@ onmessage = (ev) => {
             data: { payload: decryptedPayload, uuid: data.uuid },
           } satisfies DecryptDataResponseMessage);
         } catch (error) {
-          // Send error back to main thread with uuid so it can reject the corresponding promise
-          workerLogger.error('DataCryptor decryption failed', {
-            error,
-            participantIdentity: data.participantIdentity,
-            uuid: data.uuid,
+          // Send error back to main thread with uuid so it can reject the corresponding promise.
+          // The error response must always be posted so the awaiting future resolves; only the
+          // log is throttled to avoid flooding when a broken key keeps producing failures.
+          const errorKey = `${data.participantIdentity}-datadecrypt`;
+          const shouldLog = dataDecryptErrorLimiter.shouldEmit(errorKey, () => {
+            workerLogger.warn(
+              `Suppressing further data decryption errors for ${data.participantIdentity}`,
+              { errorKey },
+            );
           });
+          if (shouldLog) {
+            workerLogger.error('DataCryptor decryption failed', {
+              error,
+              participantIdentity: data.participantIdentity,
+              uuid: data.uuid,
+            });
+          }
           postMessage({
             kind: 'error',
             data: {
@@ -162,6 +189,7 @@ onmessage = (ev) => {
         break;
       case 'updateCodec':
         const trackCryptor = getTrackCryptor(
+          data.operation ?? 'decode',
           data.participantIdentity,
           data.trackId,
           data.previousTrackId,
@@ -170,6 +198,9 @@ onmessage = (ev) => {
           trackCryptor.setVideoCodec(data.codec);
         }
         trackCryptor.setHasFrameMetadata(data.hasPacketTrailer);
+        if (data.operation !== 'encode') {
+          trackCryptor.setEncrypted(data.encrypted);
+        }
         workerLogger.info('updated codec', {
           participantIdentity: data.participantIdentity,
           trackId: data.trackId,
@@ -191,10 +222,8 @@ onmessage = (ev) => {
       case 'setRTPMap':
         // this is only used for the local participant
         rtpMap = data.map;
-        participantCryptors.forEach((cr) => {
-          if (cr.getParticipantIdentity() === data.participantIdentity) {
-            cr.setRtpMap(data.map);
-          }
+        cryptorsByOperation.encode.forEach((cr) => {
+          cr.setRtpMap(data.map);
         });
         break;
       case 'ratchetRequest':
@@ -225,7 +254,13 @@ async function handleRatchetRequest(data: RatchetRequestMessage['data']) {
   }
 }
 
-function getTrackCryptor(participantIdentity: string, trackId: string, previousTrackId?: string) {
+function getTrackCryptor(
+  operation: 'encode' | 'decode',
+  participantIdentity: string,
+  trackId: string,
+  previousTrackId?: string,
+) {
+  const participantCryptors = cryptorsByOperation[operation];
   let cryptors = participantCryptors.filter((c) => c.getTrackId() === trackId);
 
   if (cryptors.length === 0 && previousTrackId !== undefined && previousTrackId !== trackId) {
@@ -301,7 +336,7 @@ function getSharedKeyHandler() {
 }
 
 function unsetCryptorParticipant(trackId: string, participantIdentity: string) {
-  const cryptors = participantCryptors.filter(
+  const cryptors = cryptorsByOperation.decode.filter(
     (c) => c.getParticipantIdentity() === participantIdentity && c.getTrackId() === trackId,
   );
   if (cryptors.length > 1) {
@@ -316,13 +351,6 @@ function unsetCryptorParticipant(trackId: string, participantIdentity: string) {
   } else {
     cryptor.unsetParticipant();
   }
-}
-
-function setEncryptionEnabled(enable: boolean, participantIdentity: string) {
-  workerLogger.debug(`setting encryption enabled for all tracks of ${participantIdentity}`, {
-    enable,
-  });
-  encryptionEnabledMap.set(participantIdentity, enable);
 }
 
 async function setSharedKey(key: CryptoKey, index?: number, updateCurrentKeyIndex?: boolean) {
@@ -361,7 +389,7 @@ function emitRatchetedKeys(
 
 function handleSifTrailer(trailer: NonSharedUint8Array) {
   sifTrailer = trailer;
-  participantCryptors.forEach((c) => {
+  cryptorsByOperation.decode.forEach((c) => {
     c.setSifTrailer(trailer);
   });
 }
@@ -376,7 +404,10 @@ if (self.RTCTransformEvent) {
     const options = transformer.options as ScriptTransformOptions;
     const { kind, participantIdentity, trackId, codec, hasPacketTrailer } = options;
     messageQueue.run(async () => {
-      const cryptor = getTrackCryptor(participantIdentity, trackId);
+      const cryptor = getTrackCryptor(kind, participantIdentity, trackId);
+      if (kind === 'decode') {
+        cryptor.setEncrypted(options.encrypted);
+      }
       cryptor.setHasFrameMetadata(hasPacketTrailer);
       workerLogger.debug('onrtctransform setup', { participantIdentity, trackId, codec });
       cryptor.setupTransform(

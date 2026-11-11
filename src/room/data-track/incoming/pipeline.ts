@@ -1,12 +1,12 @@
-import type { Throws } from '@livekit/throws-transformer/throws';
 import type { BaseE2EEManager } from '../../../e2ee/E2eeManager';
 import { LoggerNames, getLogger } from '../../../logger';
+import type { Throws } from '../../../utils/throws';
 import DataTrackDepacketizer, { DataTrackDepacketizerDropError } from '../depacketizer';
 import type { DataTrackFrameInternal } from '../frame';
 import { DataTrackPacket } from '../packet';
 import { type DataTrackInfo, type RemoteDataTrackPipelineOptions } from '../types';
 
-const log = getLogger(LoggerNames.DataTracks);
+const log = /* @__PURE__ */ getLogger(LoggerNames.DataTracks);
 
 /**
  * Options for creating a {@link IncomingDataTrackPipeline}.

@@ -7,12 +7,16 @@ import {
   Encryption_Type,
 } from '@livekit/protocol';
 import log from '../../../logger';
+import { type RoomDataStreamOptions } from '../../../options';
 import { type NonSharedUint8Array } from '../../../type-polyfills/non-shared-typed-arrays';
 import { DataStreamError, DataStreamErrorReason } from '../../errors';
 import { type ByteStreamInfo, type StreamController, type TextStreamInfo } from '../../types';
-import { bigIntToNumber, isCompressionStreamSupported, numberToBigInt } from '../../utils';
+import { bigIntToNumber, isDeflateRawCompressionSupported, numberToBigInt } from '../../utils';
 import { deflateRawDecompress, inflateRawTransform } from '../compression';
-import { DEFAULT_MAX_PAYLOAD_BYTE_LENGTH } from '../constants';
+import {
+  DEFAULT_MAX_OPEN_STREAMS_PER_PARTICIPANT,
+  DEFAULT_MAX_PAYLOAD_BYTE_LENGTH,
+} from '../constants';
 import {
   type ByteStreamHandler,
   ByteStreamReader,
@@ -27,8 +31,15 @@ export default class IncomingDataStreamManager {
    * errored (decompression-bomb guard). */
   private maxPayloadByteLength: number;
 
-  constructor(maxPayloadByteLength: number = DEFAULT_MAX_PAYLOAD_BYTE_LENGTH) {
+  /** Max number of incoming streams a single remote participant may have open at once. */
+  private maxOpenStreamsPerParticipant: number;
+
+  constructor({
+    maxPayloadByteLength = DEFAULT_MAX_PAYLOAD_BYTE_LENGTH,
+    maxOpenStreamsPerParticipant = DEFAULT_MAX_OPEN_STREAMS_PER_PARTICIPANT,
+  }: RoomDataStreamOptions = {}) {
     this.maxPayloadByteLength = maxPayloadByteLength;
+    this.maxOpenStreamsPerParticipant = maxOpenStreamsPerParticipant;
   }
 
   private byteStreamControllers = new Map<string, StreamController<DataStream_Chunk>>();
@@ -87,6 +98,17 @@ export default class IncomingDataStreamManager {
   }
 
   clearControllers() {
+    // Error any in flight streams so readers do not wait forever for chunks that can no longer arrive.
+    const abnormalEndError = new DataStreamError(
+      'Room disconnected in the middle of receiving data',
+      DataStreamErrorReason.AbnormalEnd,
+    );
+    for (const { controller } of this.byteStreamControllers.values()) {
+      controller.error(abnormalEndError);
+    }
+    for (const { controller } of this.textStreamControllers.values()) {
+      controller.error(abnormalEndError);
+    }
     this.byteStreamControllers.clear();
     this.textStreamControllers.clear();
     this.bufferedPackets = [];
@@ -141,11 +163,31 @@ export default class IncomingDataStreamManager {
     }
   }
 
+  /** Returns true if the given participant already has the maximum number of streams open. */
+  private hasTooManyOpenStreams(participantIdentity: string) {
+    let openStreamCount = 0;
+    for (const controllers of [this.byteStreamControllers, this.textStreamControllers]) {
+      for (const { sendingParticipantIdentity } of controllers.values()) {
+        if (sendingParticipantIdentity === participantIdentity) {
+          openStreamCount += 1;
+        }
+      }
+    }
+    return openStreamCount >= this.maxOpenStreamsPerParticipant;
+  }
+
   private handleStreamHeader(
     streamHeader: DataStream_Header,
     participantIdentity: string,
     encryptionType: Encryption_Type,
   ) {
+    if (this.hasTooManyOpenStreams(participantIdentity)) {
+      this.log.error(
+        `Participant ${participantIdentity} already has ${this.maxOpenStreamsPerParticipant} data streams open, dropping stream ${streamHeader.streamId}`,
+      );
+      return;
+    }
+
     switch (streamHeader.contentHeader.case) {
       case 'byteHeader': {
         const streamHandlerCallback = this.byteStreamHandlers.get(streamHeader.topic);
@@ -174,11 +216,11 @@ export default class IncomingDataStreamManager {
         let compressed;
         switch (streamHeader.compression) {
           case DataStream_CompressionType.DEFLATE_RAW:
-            if (!isCompressionStreamSupported()) {
+            if (!isDeflateRawCompressionSupported()) {
               // NOTE: this shouldn't really ever happen, if this warning is logged then the sender
               // isn't properly abiding by the data streams v2 protocol.
               log.warn(
-                `Data stream ${streamHeader.streamId} received with deflate-raw compression, but this browser does not have support for DecompressionStream. Dropping...`,
+                `Data stream ${streamHeader.streamId} received with deflate-raw compression, but this browser does not support deflate-raw decompression. Dropping...`,
               );
               return;
             }
@@ -235,6 +277,16 @@ export default class IncomingDataStreamManager {
               sendingParticipantIdentity: participantIdentity,
             });
           },
+          cancel: () => {
+            // The consumer side of the pipe chain errored (e.g. `ensureOrderedChunks` saw a gap) or
+            // was cancelled, which cancels this source stream. Unregister it so later chunks and the
+            // trailer for this stream are dropped rather than hitting a closed controller.
+            if (
+              this.byteStreamControllers.get(streamHeader.streamId)?.controller === streamController
+            ) {
+              this.byteStreamControllers.delete(streamHeader.streamId);
+            }
+          },
         });
         streamHandlerCallback(
           new ByteStreamReader(
@@ -279,11 +331,11 @@ export default class IncomingDataStreamManager {
         let compressed;
         switch (streamHeader.compression) {
           case DataStream_CompressionType.DEFLATE_RAW:
-            if (!isCompressionStreamSupported()) {
+            if (!isDeflateRawCompressionSupported()) {
               // NOTE: this shouldn't really ever happen, if this warning is logged then the sender
               // isn't properly abiding by the data streams v2 protocol.
               log.warn(
-                `Data stream ${streamHeader.streamId} received with deflate-raw compression, but this browser does not have support for DecompressionStream. Dropping...`,
+                `Data stream ${streamHeader.streamId} received with deflate-raw compression, but this browser does not support deflate-raw decompression. Dropping...`,
               );
               return;
             }
@@ -337,6 +389,16 @@ export default class IncomingDataStreamManager {
               startTime: Date.now(),
               sendingParticipantIdentity: participantIdentity,
             });
+          },
+          cancel: () => {
+            // The consumer side of the pipe chain errored (e.g. `ensureOrderedChunks` saw a gap) or
+            // was cancelled, which cancels this source stream. Unregister it so later chunks and the
+            // trailer for this stream are dropped rather than hitting a closed controller.
+            if (
+              this.textStreamControllers.get(streamHeader.streamId)?.controller === streamController
+            ) {
+              this.textStreamControllers.delete(streamHeader.streamId);
+            }
           },
         });
         streamHandlerCallback(

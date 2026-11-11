@@ -11,8 +11,10 @@ import {
   WrappedJoinRequest_Compression,
 } from '@livekit/protocol';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mutex } from '@livekit/mutex';
 import { ConnectionError, ConnectionErrorReason } from '../room/errors';
 import CriticalTimers from '../room/timers';
+import { Future } from '../room/utils';
 import { SignalClient, SignalConnectionState } from './SignalClient';
 import type { WebSocketCloseInfo, WebSocketConnection } from './WebSocketStream';
 import { WebSocketStream } from './WebSocketStream';
@@ -147,6 +149,167 @@ describe('SignalClient.connect', () => {
     return JoinRequest.fromBinary(bytes);
   }
 
+  describe('Cancelled connection attempts', () => {
+    it.each(['before join', 'while waiting for the connection lock'])(
+      'does not open a transport when aborted %s',
+      async (when) => {
+        const abortController = new AbortController();
+        const internals = signalClient as unknown as { connectionLock: Mutex };
+        const unlock = await internals.connectionLock.lock();
+        mockWebSocketStream({
+          connection: createMockConnection(
+            createMockReadableStream([createSignalResponse('join', createJoinResponse())]),
+          ),
+        });
+        if (when === 'before join') abortController.abort();
+        const joining = signalClient.join(
+          'wss://test.livekit.io',
+          'test-token',
+          defaultOptions,
+          abortController.signal,
+        );
+        abortController.abort();
+        unlock();
+
+        try {
+          await expect(joining).rejects.toMatchObject({ reason: ConnectionErrorReason.Cancelled });
+          expect(WebSocketStream).not.toHaveBeenCalled();
+        } finally {
+          await signalClient.close();
+          vi.mocked(WebSocketStream).mockReset();
+        }
+      },
+    );
+
+    it('does not replace a transport when aborted during its teardown', async () => {
+      const abortController = new AbortController();
+      const internals = signalClient as unknown as {
+        connectionLock: Mutex;
+        teardownTransport: (reason: string) => Promise<void>;
+      };
+      const teardownStarted = new Future<void, Error>();
+      const finishTeardown = new Future<void, Error>();
+      vi.spyOn(internals, 'teardownTransport').mockImplementationOnce(async () => {
+        teardownStarted.resolve?.();
+        await finishTeardown.promise;
+      });
+      signalClient.ws = {
+        close: () => {},
+        closed: Promise.resolve({ closeCode: 1000, reason: '' }),
+      } as WebSocketStream;
+      mockWebSocketStream({
+        connection: createMockConnection(
+          createMockReadableStream([createSignalResponse('join', createJoinResponse())]),
+        ),
+      });
+
+      const joining = signalClient.join(
+        'wss://test.livekit.io',
+        'test-token',
+        defaultOptions,
+        abortController.signal,
+      );
+      const cancelled = expect(joining).rejects.toMatchObject({
+        reason: ConnectionErrorReason.Cancelled,
+      });
+      await teardownStarted.promise;
+      abortController.abort();
+      finishTeardown.resolve?.();
+      await cancelled;
+      // The rejection can settle before the transport replacement resumes.
+      const unlock = await internals.connectionLock.lock();
+      unlock();
+
+      try {
+        expect(WebSocketStream).not.toHaveBeenCalled();
+      } finally {
+        await signalClient.close();
+        vi.mocked(WebSocketStream).mockReset();
+      }
+    });
+    it('does not validate the url when aborted while the websocket is opening', async () => {
+      const abortController = new AbortController();
+      const internals = signalClient as unknown as { connectionLock: Mutex };
+      const opened = new Future<WebSocketConnection, Error>();
+      opened.promise.catch(() => {});
+      mockWebSocketStream({ opened: opened.promise, readyState: 0 });
+      vi.mocked(global.fetch).mockClear();
+
+      const joining = signalClient.join(
+        'wss://test.livekit.io',
+        'test-token',
+        defaultOptions,
+        abortController.signal,
+      );
+      const cancelled = expect(joining).rejects.toMatchObject({
+        reason: ConnectionErrorReason.Cancelled,
+      });
+      await vi.waitFor(() => expect(WebSocketStream).toHaveBeenCalled());
+      abortController.abort();
+      opened.reject?.(new Error('closed by abort'));
+      await cancelled;
+      // let the attempt's continuation run to completion
+      const unlock = await internals.connectionLock.lock();
+      unlock();
+
+      try {
+        expect(global.fetch).not.toHaveBeenCalled();
+      } finally {
+        await signalClient.close();
+        vi.mocked(WebSocketStream).mockReset();
+      }
+    });
+
+    it('does not report a join that arrives after the attempt was aborted', async () => {
+      const abortController = new AbortController();
+      const internals = signalClient as unknown as { connectionLock: Mutex };
+      let enqueue: ((chunk: ArrayBuffer) => void) | undefined;
+      const readable = new ReadableStream<ArrayBuffer>({
+        start(controller) {
+          enqueue = (chunk) => controller.enqueue(chunk);
+        },
+      });
+      const writerReady = new Future<void, Error>();
+      const writable = new WritableStream();
+      const getWriter = writable.getWriter.bind(writable);
+      writable.getWriter = () => {
+        const writer = getWriter();
+        writerReady.resolve?.();
+        return writer;
+      };
+      mockWebSocketStream({
+        connection: { readable, writable, protocol: '', extensions: '' },
+      });
+      const onJoined = vi.fn();
+      signalClient.onJoined = onJoined;
+
+      const joining = signalClient.join(
+        'wss://test.livekit.io',
+        'test-token',
+        defaultOptions,
+        abortController.signal,
+      );
+      const cancelled = expect(joining).rejects.toMatchObject({
+        reason: ConnectionErrorReason.Cancelled,
+      });
+      await writerReady.promise;
+      abortController.abort();
+      enqueue?.(
+        createSignalResponse('join', createJoinResponse()).toBinary().buffer as ArrayBuffer,
+      );
+      await cancelled;
+      const unlock = await internals.connectionLock.lock();
+      unlock();
+
+      try {
+        expect(onJoined).not.toHaveBeenCalled();
+      } finally {
+        await signalClient.close();
+        vi.mocked(WebSocketStream).mockReset();
+      }
+    });
+  });
+
   describe('Happy Path - Initial Join', () => {
     it('should successfully connect and receive join response', async () => {
       const joinResponse = createJoinResponse();
@@ -160,6 +323,17 @@ describe('SignalClient.connect', () => {
 
       expect(result).toEqual(joinResponse);
       expect(signalClient.currentState).toBe(SignalConnectionState.CONNECTED);
+    });
+
+    it('releases the connection lock when the url is malformed', async () => {
+      await expect(signalClient.join('not a url', 'test-token', defaultOptions)).rejects.toThrow();
+
+      const joinResponse = createJoinResponse();
+      const mockReadable = createMockReadableStream([createSignalResponse('join', joinResponse)]);
+      mockWebSocketStream({ connection: createMockConnection(mockReadable) });
+
+      const result = await signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions);
+      expect(result).toEqual(joinResponse);
     });
 
     it('does not advertise packet trailer capability by default', async () => {
@@ -206,6 +380,152 @@ describe('SignalClient.connect', () => {
         ClientInfo_Capability.CAP_PACKET_TRAILER,
       ]);
     });
+
+    it('does not request full ICE by default', async () => {
+      const joinResponse = createJoinResponse();
+      const signalResponse = createSignalResponse('join', joinResponse);
+      const mockReadable = createMockReadableStream([signalResponse]);
+      const mockConnection = createMockConnection(mockReadable);
+      let capturedUrl = '';
+
+      mockWebSocketStream({
+        connection: mockConnection,
+        onUrl: (url) => {
+          capturedUrl = url;
+        },
+      });
+
+      await signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions);
+
+      const joinRequest = await decodeJoinRequestFromUrl(capturedUrl);
+      expect(joinRequest.connectionSettings?.disableIceLite).toBe(false);
+    });
+
+    it('requests full ICE in the join request when disableIceLite is set', async () => {
+      const joinResponse = createJoinResponse();
+      const signalResponse = createSignalResponse('join', joinResponse);
+      const mockReadable = createMockReadableStream([signalResponse]);
+      const mockConnection = createMockConnection(mockReadable);
+      let capturedUrl = '';
+
+      mockWebSocketStream({
+        connection: mockConnection,
+        onUrl: (url) => {
+          capturedUrl = url;
+        },
+      });
+
+      await signalClient.join('wss://test.livekit.io', 'test-token', {
+        ...defaultOptions,
+        disableIceLite: true,
+      });
+
+      const joinRequest = await decodeJoinRequestFromUrl(capturedUrl);
+      expect(joinRequest.connectionSettings?.disableIceLite).toBe(true);
+    });
+
+    it('requests full ICE on the v0 path when disableIceLite is set', async () => {
+      const joinResponse = createJoinResponse();
+      const signalResponse = createSignalResponse('join', joinResponse);
+      const mockReadable = createMockReadableStream([signalResponse]);
+      const mockConnection = createMockConnection(mockReadable);
+      let capturedUrl = '';
+
+      mockWebSocketStream({
+        connection: mockConnection,
+        onUrl: (url) => {
+          capturedUrl = url;
+        },
+      });
+
+      await signalClient.join(
+        'wss://test.livekit.io',
+        'test-token',
+        { ...defaultOptions, disableIceLite: true },
+        undefined,
+        true,
+      );
+
+      expect(new URL(capturedUrl).searchParams.get('disable_ice_lite')).toBe('1');
+    });
+
+    it('leaves subscriberAllowPause unset by default so the server default applies', async () => {
+      const joinResponse = createJoinResponse();
+      const signalResponse = createSignalResponse('join', joinResponse);
+      const mockReadable = createMockReadableStream([signalResponse]);
+      const mockConnection = createMockConnection(mockReadable);
+      let capturedUrl = '';
+
+      mockWebSocketStream({
+        connection: mockConnection,
+        onUrl: (url) => {
+          capturedUrl = url;
+        },
+      });
+
+      await signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions);
+
+      const joinRequest = await decodeJoinRequestFromUrl(capturedUrl);
+      expect(joinRequest.connectionSettings?.subscriberAllowPause).toBeUndefined();
+    });
+
+    it.each([true, false])(
+      'sets subscriberAllowPause=%s in the join request',
+      async (subscriberAllowPause) => {
+        const joinResponse = createJoinResponse();
+        const signalResponse = createSignalResponse('join', joinResponse);
+        const mockReadable = createMockReadableStream([signalResponse]);
+        const mockConnection = createMockConnection(mockReadable);
+        let capturedUrl = '';
+
+        mockWebSocketStream({
+          connection: mockConnection,
+          onUrl: (url) => {
+            capturedUrl = url;
+          },
+        });
+
+        await signalClient.join('wss://test.livekit.io', 'test-token', {
+          ...defaultOptions,
+          subscriberAllowPause,
+        });
+
+        const joinRequest = await decodeJoinRequestFromUrl(capturedUrl);
+        expect(joinRequest.connectionSettings?.subscriberAllowPause).toBe(subscriberAllowPause);
+      },
+    );
+
+    it.each([
+      [undefined, null],
+      [true, '1'],
+      [false, '0'],
+    ])(
+      'sets subscriber_allow_pause on the v0 path when subscriberAllowPause=%s',
+      async (subscriberAllowPause, expected) => {
+        const joinResponse = createJoinResponse();
+        const signalResponse = createSignalResponse('join', joinResponse);
+        const mockReadable = createMockReadableStream([signalResponse]);
+        const mockConnection = createMockConnection(mockReadable);
+        let capturedUrl = '';
+
+        mockWebSocketStream({
+          connection: mockConnection,
+          onUrl: (url) => {
+            capturedUrl = url;
+          },
+        });
+
+        await signalClient.join(
+          'wss://test.livekit.io',
+          'test-token',
+          { ...defaultOptions, subscriberAllowPause },
+          undefined,
+          true,
+        );
+
+        expect(new URL(capturedUrl).searchParams.get('subscriber_allow_pause')).toBe(expected);
+      },
+    );
   });
 
   describe('Happy Path - Reconnect', () => {
@@ -236,7 +556,7 @@ describe('SignalClient.connect', () => {
       expect(signalClient.currentState).toBe(SignalConnectionState.CONNECTED);
     });
 
-    it('should handle reconnect with non-reconnect message (edge case)', async () => {
+    it('drops stray messages during reconnect and waits for the reconnect response', async () => {
       // First, initial connection
       const joinResponse = createJoinResponse();
       const joinSignalResponse = createSignalResponse('join', joinResponse);
@@ -247,19 +567,24 @@ describe('SignalClient.connect', () => {
 
       await signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions);
 
-      // Setup reconnect with non-reconnect message (e.g., participant update)
+      // Server sends a stray update first, then the actual reconnect response.
+      // The stray should be dropped with a warning; the reconnect response should resolve.
       const updateSignalResponse = createSignalResponse('update', { participants: [] });
-      const reconnectMockReadable = createMockReadableStream([updateSignalResponse]);
+      const reconnectResponse = new ReconnectResponse({ iceServers: [] });
+      const reconnectSignalResponse = createSignalResponse('reconnect', reconnectResponse);
+      const reconnectMockReadable = createMockReadableStream([
+        updateSignalResponse,
+        reconnectSignalResponse,
+      ]);
       const reconnectMockConnection = createMockConnection(reconnectMockReadable);
 
       mockWebSocketStream({ connection: reconnectMockConnection });
 
       const result = await signalClient.reconnect('wss://test.livekit.io', 'test-token', 'sid-123');
 
-      // This is an edge case: reconnect resolves with undefined when non-reconnect message is received
-      expect(result).toBeUndefined();
+      expect(result).toEqual(reconnectResponse);
       expect(signalClient.currentState).toBe(SignalConnectionState.CONNECTED);
-    }, 1000);
+    });
   });
 
   describe('Failure Case - Timeout', () => {
@@ -619,6 +944,113 @@ describe('SignalClient.connect', () => {
     });
   });
 
+  describe('Signal stream read errors', () => {
+    async function join() {
+      mockWebSocketStream({
+        connection: createMockConnection(
+          createMockReadableStream([createSignalResponse('join', createJoinResponse())]),
+        ),
+      });
+      const closeReasons: Array<string> = [];
+      signalClient.onClose = (reason) => closeReasons.push(reason);
+      await signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions);
+      expect(signalClient.currentState).toBe(SignalConnectionState.CONNECTED);
+      return closeReasons;
+    }
+
+    function failingReader(error: unknown) {
+      return { read: () => Promise.reject(error) } as unknown as ReadableStreamDefaultReader<
+        string | ArrayBuffer
+      >;
+    }
+
+    it('logs an unexpected read failure at error level and reports the close', async () => {
+      const closeReasons = await join();
+      const errorSpy = vi.spyOn((signalClient as any).log, 'error');
+
+      const error = new ConnectionError(
+        'WS closed unexpectedly',
+        ConnectionErrorReason.InternalError,
+      );
+      await signalClient.startReadingLoop(failingReader(error));
+
+      expect(errorSpy).toHaveBeenCalledWith('error reading from signal stream', { error });
+      expect(closeReasons).toEqual(['error in reading loop']);
+    });
+
+    it('does not log an error when the read fails because the client closed the connection', async () => {
+      const closeReasons = await join();
+      await signalClient.close();
+      const errorSpy = vi.spyOn((signalClient as any).log, 'error');
+      const debugSpy = vi.spyOn((signalClient as any).log, 'debug');
+
+      const error = new ConnectionError(
+        'WS closed unexpectedly',
+        ConnectionErrorReason.InternalError,
+      );
+      await signalClient.startReadingLoop(failingReader(error));
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(debugSpy).toHaveBeenCalledWith(
+        expect.stringContaining('ignoring transport close'),
+        expect.objectContaining({ reason: 'error in reading loop', error }),
+      );
+      expect(closeReasons).toEqual([]);
+    });
+  });
+
+  describe('Messages received while closing', () => {
+    it.each([
+      [
+        'leave',
+        new SignalResponse({
+          message: {
+            case: 'leave',
+            value: new LeaveRequest({ reason: DisconnectReason.CLIENT_INITIATED }),
+          },
+        }),
+      ],
+      [
+        'pongResp',
+        new SignalResponse({
+          message: { case: 'pongResp', value: { lastPingTimestamp: BigInt(Date.now()) } },
+        }),
+      ],
+    ])('does not restart the ping timeout for a %s', async (_, response) => {
+      // the server answers our leave while close() waits for the socket to close
+      let controller!: ReadableStreamDefaultController<ArrayBuffer>;
+      const readable = new ReadableStream<ArrayBuffer>({
+        start(c) {
+          controller = c;
+          c.enqueue(
+            createSignalResponse('join', createJoinResponse()).toBinary().buffer as ArrayBuffer,
+          );
+        },
+      });
+      mockWebSocketStream({ connection: createMockConnection(readable) });
+      await signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions);
+
+      vi.useFakeTimers();
+      try {
+        const warnSpy = vi.spyOn((signalClient as any).log, 'warn');
+        const closing = signalClient.close();
+        // close() has cleared the ping timers and now waits up to 250 ms for the socket to close
+        await vi.advanceTimersByTimeAsync(100);
+        controller.enqueue(response.toBinary().buffer as ArrayBuffer);
+        await vi.advanceTimersByTimeAsync(150);
+        await closing;
+        expect(signalClient.currentState).toBe(SignalConnectionState.DISCONNECTED);
+
+        // pingTimeout is 30 s in the join response
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('ping timeout triggered'));
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe('Held requests during a resume', () => {
     /**
      * Records the tracks whose mute requests reach the wire, in order. `mute` is session-scoped —
@@ -739,6 +1171,66 @@ describe('SignalClient.connect', () => {
         reason: ConnectionErrorReason.NotAllowed,
         status: 401,
       });
+    });
+  });
+
+  describe('Failure Case - Validate Request Hangs', () => {
+    // A socket that never opens on its own (a lossy network) and whose `opened` rejects once the
+    // client closes it, like a real WebSocketStream aborted during the handshake.
+    function mockHangingWebSocket() {
+      vi.mocked(WebSocketStream).mockImplementationOnce(function () {
+        let rejectOpened!: (e: unknown) => void;
+        let resolveClosed!: (info: WebSocketCloseInfo) => void;
+        return {
+          url: 'wss://test.livekit.io',
+          opened: new Promise((_, reject) => (rejectOpened = reject)),
+          closed: new Promise((resolve) => (resolveClosed = resolve)),
+          close: vi.fn(() => {
+            rejectOpened(new Error('aborted during handshake'));
+            resolveClosed({ closeCode: 1006, reason: '' });
+          }),
+          readyState: 0,
+        } as any;
+      });
+    }
+
+    it('does not let a timed-out attempt block the next one', async () => {
+      // A validate request on a dead pooled connection only settles once its abort signal fires.
+      // Without a deadline it held the connection lock, so the next attempt never started. A
+      // timed-out attempt now skips validation entirely, since its caller has already been rejected.
+      vi.useFakeTimers();
+      try {
+        const hangingFetch = (_url: unknown, init?: RequestInit) =>
+          new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+          });
+        vi.mocked(fetch).mockImplementationOnce(hangingFetch).mockImplementationOnce(hangingFetch);
+        mockHangingWebSocket();
+        mockHangingWebSocket();
+
+        // building the join request finishes on real I/O, so wait for each socket before advancing
+        const first = expect(
+          signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions),
+        ).rejects.toMatchObject({ reason: ConnectionErrorReason.Timeout });
+        await vi.waitFor(() => expect(WebSocketStream).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(defaultOptions.websocketTimeout);
+        await first;
+
+        const second = expect(
+          signalClient.join('wss://test.livekit.io', 'test-token', defaultOptions),
+        ).rejects.toMatchObject({ reason: ConnectionErrorReason.Timeout });
+        // past the validate deadline, which is what releases the lock the first attempt holds
+        await vi.advanceTimersByTimeAsync(10_000);
+        await vi.waitFor(() => expect(WebSocketStream).toHaveBeenCalledTimes(2));
+        await vi.advanceTimersByTimeAsync(defaultOptions.websocketTimeout);
+        await second;
+
+        expect(fetch).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        // drop the unused hanging fetches so they don't leak into later tests
+        vi.mocked(fetch).mockReset();
+      }
     });
   });
 
@@ -1026,7 +1518,7 @@ describe('SignalClient.validateFirstMessage', () => {
     }
   });
 
-  it('should accept non-reconnect message during reconnecting state', async () => {
+  it('should reject non-reconnect message during reconnecting state', async () => {
     // First establish a connection
     const joinResponse = createJoinResponse();
     const joinSignalResponse = createSignalResponse('join', joinResponse);
@@ -1044,9 +1536,8 @@ describe('SignalClient.validateFirstMessage', () => {
     const validateMethod = (signalClient as any).validateFirstMessage;
     if (validateMethod) {
       const result = validateMethod.call(signalClient, updateSignalResponse, true);
-      expect(result.isValid).toBe(true);
-      expect(result.response).toBeUndefined();
-      expect(result.shouldProcessFirstMessage).toBe(true);
+      expect(result.isValid).toBe(false);
+      expect(result.error).toBeInstanceOf(ConnectionError);
     }
   });
 

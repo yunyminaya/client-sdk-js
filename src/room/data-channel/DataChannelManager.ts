@@ -1,3 +1,4 @@
+import { NegotiatedDataChannelID } from '@livekit/protocol';
 import type { PCTransportManager } from '../PCTransportManager';
 import { FlowControlledDataChannel } from './FlowControlledDataChannel';
 import { LossyDataChannel } from './LossyDataChannel';
@@ -24,13 +25,24 @@ export interface DataChannelManagerOptions {
   onBufferStatusChanged: (kind: DataChannelKind, isLow: boolean) => void;
 }
 
+/** Unhooks every handler the manager may have wired onto `dc`, ahead of closing it. */
+function clearHandlers(dc: RTCDataChannel) {
+  dc.onbufferedamountlow = null;
+  dc.onclose = null;
+  dc.onclosing = null;
+  dc.onerror = null;
+  dc.onmessage = null;
+  dc.onopen = null;
+}
+
 /**
  * Owns the engine's data channels: the three flow-controlled publisher channel wrappers (which
  * live for the engine's lifetime and have RTCDataChannel handles attached/detached as peer
  * connections come and go) plus the subscriber-side receive handles adopted by label.
  *
- * Handle turnover goes through {@link FlowControlledDataChannel.attach}/`detach`, which reject
- * parked headroom waiters as a built-in — there is no separate invalidation step to forget.
+ * Handle turnover goes through {@link FlowControlledDataChannel.attach}/`detach`, which close the
+ * released handle and reject parked headroom waiters as a built-in — there is no separate
+ * invalidation step to forget.
  */
 export class DataChannelManager {
   readonly reliable: ReliableDataChannel;
@@ -46,6 +58,8 @@ export class DataChannelManager {
   private dataTrackSub?: RTCDataChannel;
 
   private opts: DataChannelManagerOptions;
+
+  private negotiated = false;
 
   constructor(opts: DataChannelManagerOptions) {
     this.opts = opts;
@@ -108,19 +122,27 @@ export class DataChannelManager {
     );
   }
 
+  /** Whether the current publisher channels were created as negotiated (fixed IDs). */
+  get publisherChannelsNegotiated(): boolean {
+    return this.hasPublisherChannels && this.negotiated;
+  }
+
   /**
    * Creates the three publisher data channels on the given transport, wires their handlers, and
-   * attaches them to the wrappers — attaching rejects any waiters still parked on replaced
-   * channel objects.
+   * attaches them to the wrappers — attaching closes any replaced channel objects and rejects the
+   * waiters still parked on them.
+   *
+   * With `negotiated`, the channels use fixed SCTP stream IDs agreed with the server instead of
+   * the in-band DCEP open handshake, so the server can send on them right away.
    */
-  createPublisherChannels(pcManager: PCTransportManager) {
-    // clear old data channel callbacks if recreate
+  createPublisherChannels(pcManager: PCTransportManager, negotiated: boolean = false) {
+    // Recreating (the Safari null-id path, or the in-band fallback after join): attaching the new
+    // handles below closes the old ones, so unhook them first — the old channel's close must not
+    // report an unexpected close.
     for (const channel of [this.lossy, this.reliable, this.dataTrack]) {
       const old = channel.channelHandle;
       if (old) {
-        old.onmessage = null;
-        old.onerror = null;
-        old.onclose = null;
+        clearHandlers(old);
       }
     }
 
@@ -142,11 +164,14 @@ export class DataChannelManager {
       channel.attach(dc);
     };
 
+    const idFor = (id: number) => (negotiated ? { negotiated, id } : {});
+
     wire(
       this.lossy,
       pcManager.createPublisherDataChannel(lossyDataChannelLabel, {
         ordered: false,
         maxRetransmits: 0,
+        ...idFor(NegotiatedDataChannelID.NDCI_LOSSY),
       }),
       this.opts.onDataMessage,
     );
@@ -154,6 +179,7 @@ export class DataChannelManager {
       this.reliable,
       pcManager.createPublisherDataChannel(reliableDataChannelLabel, {
         ordered: true,
+        ...idFor(NegotiatedDataChannelID.NDCI_RELIABLE),
       }),
       this.opts.onDataMessage,
     );
@@ -162,9 +188,11 @@ export class DataChannelManager {
       pcManager.createPublisherDataChannel(dataTrackDataChannelLabel, {
         ordered: false,
         maxRetransmits: 0,
+        ...idFor(NegotiatedDataChannelID.NDCI_DATA_TRACK),
       }),
       this.opts.onDataTrackMessage,
     );
+    this.negotiated = negotiated;
 
     this.lossy.startThresholdTuning();
   }
@@ -192,41 +220,36 @@ export class DataChannelManager {
   }
 
   /**
-   * Tears down all channels for a peer-connection cleanup: rejects parked waiters (detach — the
-   * spec allows `pc.close()` to transition channels to 'closed' without firing events, so waiting
-   * for browser close events is not an option), strips handlers, closes the handles, and resets
-   * the reliable session state.
+   * Tears down all channels for a peer-connection cleanup: strips handlers, closes the handles,
+   * and resets the reliable session state. Detaching the publisher handles closes them and
+   * rejects parked waiters (the spec allows `pc.close()` to transition channels to 'closed'
+   * without firing events, so waiting for browser close events is not an option).
    */
   teardown() {
-    const dcCleanup = (dc: RTCDataChannel | undefined) => {
-      if (!dc) {
-        return;
-      }
+    // Detach the data channel handlers before closing anything. Closing a peer connection tears
+    // down the SCTP transport, which can dispatch `error`/`close` events on the still-open data
+    // channels; if our handlers are still attached at that point, handleDataError logs a spurious
+    // "Unknown DataChannel error" during an otherwise graceful disconnect. Removing the handlers
+    // before dc.close()/pcManager.close() makes this deterministic regardless of how/when the
+    // browser dispatches those teardown events. See livekit/client-sdk-js#1953.
+    const publisherDataChannels = [this.lossy, this.reliable, this.dataTrack];
+    const subscriberDataChannels = [this.lossySub, this.reliableSub, this.dataTrackSub];
 
-      // Detach the data channel handlers before closing anything. Closing a peer connection tears
-      // down the SCTP transport, which can dispatch `error`/`close` events on the still-open data
-      // channels; if our handlers are still attached at that point, handleDataError logs a spurious
-      // "Unknown DataChannel error" during an otherwise graceful disconnect. Removing the handlers
-      // before dc.close()/pcManager.close() makes this deterministic regardless of how/when the
-      // browser dispatches those teardown events. See livekit/client-sdk-js#1953.
-      dc.onbufferedamountlow = null;
-      dc.onclose = null;
-      dc.onclosing = null;
-      dc.onerror = null;
-      dc.onmessage = null;
-      dc.onopen = null;
-
-      dc.close();
-    };
-
-    for (const channel of [this.lossy, this.reliable, this.dataTrack]) {
+    // Publisher handles are closed by detach, which also rejects parked waiters.
+    for (const channel of publisherDataChannels) {
       const dc = channel.channelHandle;
+      if (dc) {
+        clearHandlers(dc);
+      }
       channel.detach('peer connections cleaned up');
-      dcCleanup(dc);
     }
-    dcCleanup(this.lossySub);
-    dcCleanup(this.reliableSub);
-    dcCleanup(this.dataTrackSub);
+    // Subscriber handles have no wrapper, so close them directly.
+    for (const dc of subscriberDataChannels) {
+      if (dc) {
+        clearHandlers(dc);
+        dc.close();
+      }
+    }
     this.lossySub = undefined;
     this.reliableSub = undefined;
     this.dataTrackSub = undefined;

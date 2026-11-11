@@ -1,3 +1,4 @@
+import { getErrorDescription } from '../../api/utils';
 import { workerLogger } from '../../logger';
 import type { NonSharedUint8Array } from '../../type-polyfills/non-shared-typed-arrays';
 import { ENCRYPTION_ALGORITHM } from '../constants';
@@ -72,7 +73,7 @@ export class DataCryptor {
           name: ENCRYPTION_ALGORITHM,
           iv,
         },
-        keySet.encryptionKey,
+        ratchetOpts.encryptionKey ?? keySet.encryptionKey,
         new Uint8Array(data),
       );
       return {
@@ -102,7 +103,7 @@ export class DataCryptor {
             iv,
             keys,
             keyIndex,
-            initialMaterial,
+            initialMaterial ?? keySet,
             {
               ratchetCount: ratchetOpts.ratchetCount + 1,
               encryptionKey: ratchetedKeySet?.encryptionKey,
@@ -135,7 +136,7 @@ export class DataCryptor {
         }
       } else {
         throw new CryptorError(
-          `DataCryptor: Decryption failed: ${error.message}`,
+          `DataCryptor: Decryption failed: ${getErrorDescription(error, 'decryption')}`,
           CryptorErrorReason.InvalidKey,
           keys.participantIdentity,
         );

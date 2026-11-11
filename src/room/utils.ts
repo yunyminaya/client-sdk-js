@@ -6,14 +6,14 @@ import {
   DisconnectReason,
   Transcription as TranscriptionModel,
 } from '@livekit/protocol';
-import { type Throws } from '@livekit/throws-transformer/throws';
 import type { NonSharedUint8Array } from '../type-polyfills/non-shared-typed-arrays';
 import TypedPromise from '../utils/TypedPromise';
 import { getBrowser } from '../utils/browserParser';
 import type { BrowserDetails } from '../utils/browserParser';
+import { type Throws } from '../utils/throws';
 import { clientProtocol, protocolVersion, version } from '../version';
 import { type ConnectionError, ConnectionErrorReason } from './errors';
-import type LocalParticipant from './participant/LocalParticipant';
+import type { LocalParticipant } from './participant/LocalParticipant';
 import type Participant from './participant/Participant';
 import type RemoteParticipant from './participant/RemoteParticipant';
 import CriticalTimers from './timers';
@@ -185,6 +185,65 @@ export function negotiateDependencyDescriptor(transceiver: RTCRtpTransceiver): b
   }
 }
 
+/**
+ * VP9 and AV1 are published as SVC (a single RTP stream carrying every spatial layer)
+ * by default. They can instead be published as real, rid based simulcast — one
+ * independent stream per rid, each carrying a single spatial layer — when the caller
+ * opts in with `simulcast: true` and a single spatial layer scalability mode (`L1Tx`).
+ *
+ * The SFU has to be told about this: without an explicit
+ * `SimulcastCodec.videoLayerMode` it assumes `MULTIPLE_SPATIAL_LAYERS_PER_STREAM` for
+ * any SVC capable codec.
+ */
+export function isSVCSimulcast(
+  codec?: string,
+  options?: { simulcast?: boolean; scalabilityMode?: string },
+): boolean {
+  return isSVCCodec(codec) && !!options?.simulcast && !!options.scalabilityMode?.startsWith('L1T');
+}
+
+/**
+ * Whether the browser reads multiple encodings on an SVC capable codec as *legacy SVC*
+ * rather than as real simulcast.
+ *
+ * Before Chrome M113, supplying more than one encoding for VP9/AV1 selected SVC mode;
+ * only from M113 does libwebrtc treat such encodings as simulcast, and only when each
+ * one carries its own scalabilityMode. Safari (and anything WebKit based, i. e. every
+ * browser on iOS) still uses the old interpretation, as does React Native's libwebrtc.
+ * Announced at https://groups.google.com/g/discuss-webrtc/c/-QQ3pxrl-fw
+ *
+ * Where this is true the rids would not exist on the wire, so VP9/AV1 must be published
+ * as SVC no matter what the caller asked for.
+ */
+export function usesLegacySVCEncodings(): boolean {
+  const browser = getBrowser();
+  return (
+    isSafariBased() ||
+    // Even tho RN runs M114, it does not produce SVC layers when a single encoding
+    // is provided. So we'll use the legacy SVC specification for now.
+    // TODO: when we upstream libwebrtc, this will need additional verification
+    isReactNative() ||
+    (browser?.name === 'Chrome' && compareVersions(browser.version, '113') < 0)
+  );
+}
+
+/**
+ * Last server version that doesn't support vp9/av1 simulcast.
+ */
+const svcSimulcastMinServerVersion = '1.13.6';
+
+/**
+ * Whether the connected server honours `SimulcastCodec.videoLayerMode`, i. e. whether
+ * VP9/AV1 can be published as rid based simulcast. An unknown version is treated as
+ * unsupported so the publish falls back to SVC.
+ */
+export function isSVCSimulcastSupportedByServer(serverVersion?: string): boolean {
+  if (!serverVersion) {
+    return false;
+  }
+  return compareVersions(serverVersion, svcSimulcastMinServerVersion) > 0;
+}
+
 export function supportsSetSinkId(elm?: HTMLMediaElement): boolean {
   if (!document || isSafariBased()) {
     return false;
@@ -239,6 +298,33 @@ export function isSafari(): boolean {
 export function isSafariBased(): boolean {
   const b = getBrowser();
   return b?.name === 'Safari' || b?.os === 'iOS';
+}
+
+/**
+ * iPadOS has sent the desktop Macintosh user agent by default since iPadOS 13, so `getBrowser()`
+ * reports `os: 'macOS'` there and every `os === 'iOS'` check misses it. macOS Safari implements no
+ * touch events at all (`TouchEvent` undefined, `maxTouchPoints` 0) regardless of any touchscreen
+ * attached, so touch capability separates the two. Measured on an iPad 6 / iPadOS 17
+ * (`maxTouchPoints` 5) against macOS Safari 26.4 (`maxTouchPoints` 0).
+ *
+ * Deliberately a separate helper rather than a fix in `browserParser`: iPadOS spoofs the Mac
+ * version too, so reporting `os: 'iOS'` there would leave `osVersion` at `10.15.7` and silently
+ * break {@link isSafari17Based} and {@link isSafariSvcApi}, which compare it.
+ */
+export function isIPadOS(): boolean {
+  if (!isWeb()) {
+    return false;
+  }
+  const b = getBrowser();
+  return b?.name === 'Safari' && b?.os === 'macOS' && navigator.maxTouchPoints > 1;
+}
+
+/**
+ * iPhone, iPad and iOS-hosted browsers — everything running the Apple camera capture pipeline,
+ * including iPads that present themselves as a Mac.
+ */
+export function isAppleMobile(): boolean {
+  return getBrowser()?.os === 'iOS' || isIPadOS();
 }
 
 export function isSafari17Based(): boolean {
@@ -473,6 +559,17 @@ export function createDummyVideoStreamTrack(
 
 let emptyAudioStreamTrack: MediaStreamTrack | undefined;
 
+let emptyAudioStreamContext: AudioContext | undefined;
+
+/** tracks handed out by `getEmptyAudioStreamTrack` that haven't been released yet */
+const outstandingEmptyAudioStreamTracks = new Set<MediaStreamTrack>();
+
+/**
+ * Returns a silent audio track, cloned off a shared `AudioContext` created on first use. Hand the
+ * clone back to `releaseEmptyAudioStreamTrack` rather than stopping it, so the context can close.
+ * A clone that is only stopped stays counted as outstanding, which holds the shared context open
+ * for the lifetime of the page.
+ */
 export function getEmptyAudioStreamTrack() {
   if (!emptyAudioStreamTrack) {
     // implementation adapted from https://blog.mozilla.org/webrtc/warm-up-with-replacetrack/
@@ -486,31 +583,37 @@ export function getEmptyAudioStreamTrack() {
     oscillator.start();
     [emptyAudioStreamTrack] = dst.stream.getAudioTracks();
     if (!emptyAudioStreamTrack) {
+      // don't hold on to a context we can't get a track out of
+      ctx.close().catch(() => {});
       throw Error('Could not get empty media stream audio track');
     }
     emptyAudioStreamTrack.enabled = false;
+    emptyAudioStreamContext = ctx;
   }
-  return emptyAudioStreamTrack.clone();
+  const track = emptyAudioStreamTrack.clone();
+  outstandingEmptyAudioStreamTracks.add(track);
+  return track;
 }
 
-export function getStereoAudioStreamTrack() {
-  const ctx = new AudioContext();
-  const oscLeft = ctx.createOscillator();
-  const oscRight = ctx.createOscillator();
-  oscLeft.frequency.value = 440;
-  oscRight.frequency.value = 220;
-  const merger = ctx.createChannelMerger(2);
-  oscLeft.connect(merger, 0, 0); // left channel
-  oscRight.connect(merger, 0, 1); // right channel
-  const dst = ctx.createMediaStreamDestination();
-  merger.connect(dst);
-  oscLeft.start();
-  oscRight.start();
-  const [stereoTrack] = dst.stream.getAudioTracks();
-  if (!stereoTrack) {
-    throw Error('Could not get stereo media stream audio track');
+/**
+ * Stops a track obtained from `getEmptyAudioStreamTrack` and closes the shared `AudioContext`
+ * backing it once every track it handed out has been released. Does nothing for a track this
+ * module never handed out, or one that has been released already.
+ */
+export async function releaseEmptyAudioStreamTrack(track: MediaStreamTrack) {
+  if (!outstandingEmptyAudioStreamTracks.delete(track)) {
+    // the track wasn't obtained from `getEmptyAudioStreamTrack`, or has been released before
+    return;
   }
-  return stereoTrack;
+  track.stop();
+  if (outstandingEmptyAudioStreamTracks.size > 0) {
+    return;
+  }
+  const context = emptyAudioStreamContext;
+  emptyAudioStreamTrack?.stop();
+  emptyAudioStreamTrack = undefined;
+  emptyAudioStreamContext = undefined;
+  await context?.close();
 }
 
 /** An object that represents a serialized version of a `new Promise((resolve, reject) => {})`
@@ -622,11 +725,20 @@ export function createAudioAnalyser(
     return volume;
   };
 
+  let isCleanedUp = false;
+
   const cleanup = async () => {
-    await audioContext.close();
+    if (isCleanedUp) {
+      // closing an already closed context would reject, make repeated cleanups a no-op instead
+      return;
+    }
+    isCleanedUp = true;
+    mediaStreamSource.disconnect();
+    analyser.disconnect();
     if (opts.cloneTrack) {
       streamTrack.stop();
     }
+    await audioContext.close();
   };
 
   return { calculateVolume, analyser, cleanup };
@@ -663,6 +775,43 @@ export function unwrapConstraint(constraint: ConstrainDOMString | ConstrainULong
     return constraint.ideal;
   }
   throw Error('could not unwrap constraint');
+}
+
+/**
+ * The getUserMedia rejections that no softer constraint can recover from, because the user or the
+ * document refused capture outright. Retrying one of these would put a second prompt in front of
+ * someone who already said no. The last two names are legacy spellings still reported by older
+ * engines. Matched by `name` rather than with `instanceof`, because these are not reliably distinct
+ * constructors across environments. happy-dom, which the tests run under, aliases them to `Event`.
+ */
+export function isPermissionDeniedError(e: unknown): boolean {
+  return (
+    typeof e === 'object' &&
+    e !== null &&
+    'name' in e &&
+    (e.name === 'NotAllowedError' ||
+      e.name === 'SecurityError' ||
+      e.name === 'PermissionDeniedError' ||
+      e.name === 'PermissionDismissedError')
+  );
+}
+
+const deviceAcquisitionFailures = new WeakSet();
+
+/** Records that `e` is the rejection getUserMedia itself produced. */
+export function markDeviceAcquisitionFailure(e: unknown) {
+  if (typeof e === 'object' && e !== null) {
+    deviceAcquisitionFailures.add(e);
+  }
+}
+
+/**
+ * Whether a track restart failed at getUserMedia rather than in the work that adopts the new track.
+ * Recorded on the side rather than by wrapping, because callers of `restartTrack` match on the
+ * rejection's own name.
+ */
+export function isDeviceAcquisitionFailure(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && deviceAcquisitionFailures.has(e);
 }
 
 export function toWebsocketUrl(url: string): string {
@@ -900,6 +1049,49 @@ export function extractMaxAgeFromRequestHeaders(headers: Headers): number | unde
 
 export function isCompressionStreamSupported() {
   return typeof CompressionStream !== 'undefined';
+}
+
+let deflateRawCompressionSupported: boolean | null = null;
+
+/**
+ * Whether this runtime can compress AND decompress the `deflate-raw` format, which is a stricter
+ * requirement than {@link isCompressionStreamSupported}: Chromium 80-102 included
+ * `CompressionStream` supporting only `gzip` / `deflate`, and `deflate-raw` was added in Chromium
+ * 103 (Firefox 113, Safari 16.4).
+ */
+export function isDeflateRawCompressionSupported(): boolean {
+  if (typeof deflateRawCompressionSupported !== 'boolean') {
+    deflateRawCompressionSupported = probeDeflateRawCompressionSupport();
+  }
+  return deflateRawCompressionSupported;
+}
+
+function probeDeflateRawCompressionSupport(): boolean {
+  if (typeof CompressionStream === 'undefined' || typeof DecompressionStream === 'undefined') {
+    return false;
+  }
+  try {
+    // There is no api to query format support, and constructing with an unsupported format throws
+    // synchronously, so constructing one of each is the probe. Both are checked because the
+    // deflate-raw capability advertised to peers is as much about decompressing what they send us
+    // as it is about compressing what we send them.
+    new CompressionStream('deflate-raw');
+    new DecompressionStream('deflate-raw');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Clears the memoized {@link isDeflateRawCompressionSupported} probe result. A runtime doesn't
+ * gain or lose compression formats while it is running, so this only exists for tests that swap
+ * the global `CompressionStream` / `DecompressionStream`.
+ *
+ * @internal
+ */
+export function resetDeflateRawCompressionSupportCache() {
+  deflateRawCompressionSupported = null;
 }
 
 export function isPublisherOfferWithJoinSupported() {
